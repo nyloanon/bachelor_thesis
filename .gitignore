@@ -1,2 +1,5 @@
 /data
 /figures
+/tests
+/evaluation_plots
+/checkpoints
