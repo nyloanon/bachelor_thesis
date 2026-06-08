@@ -1,3 +1,10 @@
+# ==== GPU selection ====
+from autocvd import autocvd
+autocvd(num_gpus=1)
+# ruff: noqa: E402
+# =======================
+
+
 # imports
 
 import numpy as np
@@ -7,6 +14,10 @@ import equinox as eqx
 import optax 
 import glob
 import matplotlib.pyplot as plt
+
+# saving models
+import os
+os.makedirs("checkpoints", exist_ok=True)
 
 
 
@@ -40,50 +51,52 @@ class Velocity_field_mlp(eqx.Module):
     return v.reshape(x.shape)
 
 """### 3.1.2 CNN Model
-Using the Equinox library and Jax a CNN velocity field on a 64x64 grid is set up. The activation function used in all hidden layers is the SiLu function: $\text{SiLu}(x) = x \cdot \sigma(x)$.
+Using the Equinox library and Jax a CNN velocity field on a 256x256 grid is set up. The activation function used in all hidden layers is the SiLu function: r"$\text{SiLu}(x) = x \cdot \sigma(x)$".
 """
 
 class Velocity_field_cnn(eqx.Module):
-  conv1: eqx.nn.Conv2d
-  conv2: eqx.nn.Conv2d
-  conv3: eqx.nn.Conv2d
-  conv4: eqx.nn.Conv2d
-  conv5: eqx.nn.Conv2d
+    
+    conv1: eqx.nn.Conv2d
+    conv2: eqx.nn.Conv2d
+    conv3: eqx.nn.Conv2d
+    conv4: eqx.nn.Conv2d
+    conv5: eqx.nn.Conv2d
 
-  def __init__(self, key):
+    def __init__(self, key):
 
-    keys = jax.random.split(key, 5)   # number of keys matches number of layers
+        keys = jax.random.split(key, 5)
 
-    self.conv1 = eqx.nn.Conv2d(
-        1, 32, kernel_size=3, padding=1, key=keys[0]
-    )
-    self.conv2 = eqx.nn.Conv2d(
-        32, 64, kernel_size=3, padding=1, key=keys[1]
-    )
-    self.conv3 = eqx.nn.Conv2d(
-        64, 64, kernel_size=3, padding=1, key=keys[2]
-    )
-    self.conv4 = eqx.nn.Conv2d(
-        64, 32, kernel_size=3, padding=1, key=keys[3]
-    )
-    self.conv5 = eqx.nn.Conv2d(
-        32, 1, kernel_size=3, padding=1, key=keys[4]
-    )
+        self.conv1 = eqx.nn.Conv2d(
+            2, 32, kernel_size=3, padding=1, key=keys[0]
+        )
+        self.conv2 = eqx.nn.Conv2d(
+            32, 64, kernel_size=3, padding=1, key=keys[1]
+        )
+        self.conv3 = eqx.nn.Conv2d(
+            64, 64, kernel_size=3, padding=1, key=keys[2]
+        )
+        self.conv4 = eqx.nn.Conv2d(
+            64, 32, kernel_size=3, padding=1, key=keys[3]
+        )
+        self.conv5 = eqx.nn.Conv2d(
+            32, 1, kernel_size=3, padding=1, key=keys[4]
+        )
 
-  def __call__(self, x, t):
+    def __call__(self, x, t):
+        # x: (C, H, W)
 
-    t = t[:, :, None, None]
+        t_emb = jnp.array([t])  # scalar feature
+        t_emb = jnp.broadcast_to(t_emb, (1, x.shape[1], x.shape[2]))
+        x = jnp.concatenate([x, t_emb], axis=0)
 
-    x = x + t
+        x = jax.nn.silu(self.conv1(x))
+        x = jax.nn.silu(self.conv2(x))
+        x = jax.nn.silu(self.conv3(x))
+        x = jax.nn.silu(self.conv4(x))
+        x = self.conv5(x)
 
-    def forward_single(xi):
-        h = jax.nn.silu(self.conv1(xi))
-        h = jax.nn.silu(self.conv2(h))
-        h = jax.nn.silu(self.conv3(h))
-        h = jax.nn.silu(self.conv4(h))
-        return self.conv5(h)
+        return x
 
-    return jax.vmap(forward_single)(x)
 
 """### 1.2 Data generation
 Data batches are divided into single samples at the current time point t. The image x_t, time t itself and the target velocity v_target are returned.
@@ -126,10 +139,12 @@ For the loss a simple mean squared error is implemented.
 """
 
 def loss_function(model, x_t, t, v_target):
-  
-  v_pred = model(x_t, t)
 
-  return jnp.mean((v_target - v_pred) ** 2)
+    batched_model = jax.vmap(model, in_axes=(0, 0))
+
+    v_pred = batched_model(x_t, t)
+
+    return jnp.mean((v_pred - v_target) ** 2)
 
 """### 1.4 Training
 Using the optax library we set up the training of the model.
@@ -148,33 +163,37 @@ def train_step(model, opt_state, x_t, t, v_target):
 
 """### 1.5 Sampling"""
 
-def sample(model, x, steps, modelname):
+def sample(model, x, steps, modelname=None):
 
     dt = 1.0 / steps
 
-    if modelname == 1:
-      x = x[None, :, :]   # add channel for CNN
-
     for i in range(steps):
 
-      t = jnp.array([[i / steps]])
+        t = i / steps
 
-      v = model(x, t)   # <-- v_theta(x_t)
+        # velocity at current state
+        v1 = model(x, t)
 
-      x = x + dt * v
+        # Euler prediction
+        x_euler = x + dt * v1
 
-    if modelname == 1:
-      return x[0]
+        # next time (clamped to training range)
+        t_next = min(t + dt, 1.0)
+
+        # velocity at predicted state
+        v2 = model(x_euler, t_next)
+
+        # Heun update
+        x = x + dt * 0.5 * (v1 + v2)
 
     return x
-
 
 # ----------------- data import -------------------------------
 
 files = sorted(glob.glob("data/final_state_*.npy"))
 # only load the density data first
 data = np.stack([np.load(f)[0] for f in files]) 
-small_data = data[:8]
+small_data = data[:500]
 # normalize data
 mean = data.mean()
 std = data.std()
@@ -182,29 +201,51 @@ data = (data - mean) / std
 # put data in correct shape 
 data = data[:, None, :, :]
 
-# ----------------- training loop ----------------------------
-
+# ----------------- training setup ----------------------------
 # hyperparameters
-batch_size = 4
-num_steps = 5000
+batch_size = 16
+num_steps = 20000
 
 key = jax.random.key(0)
 
 model = Velocity_field_cnn(key)
 
-# set learning_rate
+# set learning rate
 optimizer = optax.adam(learning_rate=1e-4)
 opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
+# ----------------- fixed validation set ----------------------
+
+val_key = jax.random.key(12345)
+
+x_val, t_val, v_val = sample_batch(
+    val_key,
+    data,
+    batch_size=16
+)
+
+# ----------------- fixed sample noises -----------------------
+
+noise_key = jax.random.key(999)
+fixed_noises = jax.random.split(noise_key, 4)
+
+fixed_noises = [
+    jax.random.normal(k, (1, 256, 256))
+    for k in fixed_noises
+]
+
+# ----------------- training loop -----------------------------
 
 loss_history = []
+val_mse_history = []
+checkpoint_steps = {2000, 5000, 10000, 20000}
 
-for step in range(num_steps+1):
+for step in range(num_steps + 1):
 
     key, subkey = jax.random.split(key)
 
     x_t, t, v_target = sample_batch(
-        subkey, 
+        subkey,
         data,
         batch_size
     )
@@ -218,89 +259,114 @@ for step in range(num_steps+1):
     )
 
     loss_history.append(loss)
-    # print progress
+
+    # evaluate on fixed validation batch
     if step % 100 == 0:
-        print(f"step {step}, loss {loss}")
+
+        v_pred_val = jax.vmap(
+            lambda x, t_: model(x, t_)
+        )(x_val, t_val)
+
+        val_mse = jnp.mean(
+            (v_pred_val - v_val) ** 2
+        )
+
+        val_mse_history.append(val_mse)
+
+        print(
+            f"step {step}, "
+            f"train loss {loss:.4f}, "
+            f"val mse {val_mse:.4f}"
+        )
+
+        if step in checkpoint_steps:
+            eqx.tree_serialise_leaves(
+            f"checkpoints/velocity_field_{step}.eqx",
+            model
+            )
+            
 
 
-# save the model parameters 
+#------------------ load models -----------------------------
 
-eqx.tree_serialise_leaves(
-    "velocity_field.eqx",
-    model
-)
+def load_model(step, template_model):
+    return eqx.tree_deserialise_leaves(
+        f"checkpoints/velocity_field_{step}.eqx",
+        template_model
+    )
 
-# loading the model
-model = eqx.tree_deserialise_leaves(
-    "velocity_field.eqx",
-    model
-)
+# load a template model to fill
+key = jax.random.key(0)
+template_model = Velocity_field_cnn(key)
+model_vis = load_model(20000, template_model)
 
-# plot the loss
+# ----------------- plot training history --------------------
+
+plt.figure()
 plt.plot(loss_history)
-plt.yscale("log")  # very useful for flows
+plt.yscale("log")
 plt.xlabel("step")
 plt.ylabel("loss")
-plt.title("Training loss (Flow Matching)")
-plt.show()
-
-# test sampling
-key = jax.random.key(42)
-x = jax.random.normal(
-    key, 
-    (256, 256)
-)
-
-x_gen = sample(
-    model,
-    x,
-    steps=100,
-    modelname=1 
-)
-
-plt.imshow(x_gen[0], origin="lower")
-plt.colorbar()
-plt.savefig('test_sample.png')
-
-
-# compare velocity prediction and target velocity
-key, subkey = jax.random.split(key)
-
-x_t, t, v_target = sample_batch(subkey, data, batch_size=8)
-
-v_pred = jax.vmap(lambda x, t_: model(x, t_))(x_t, t)
-
-mse = jnp.mean((v_pred - v_target) ** 2)
-
-print("velocity MSE:", mse)
-
-rel_error = jnp.mean((v_pred - v_target) ** 2) / jnp.mean(v_target ** 2)
-print("relative error:", rel_error)
-
-# plot target and prediction
-
-key, subkey = jax.random.split(key)
-
-x_t, t, v_target = sample_batch(subkey, data, batch_size=1)
-
-v_pred = model(x_t[0], t[0])
+plt.title("Training loss")
+plt.savefig("loss_history.png")
 
 plt.figure()
-plt.imshow(v_target[0, 0], cmap="RdBu")
+plt.plot(
+    np.arange(len(val_mse_history)) * 100,
+    val_mse_history
+)
+plt.yscale("log")
+plt.xlabel("step")
+plt.ylabel("validation MSE")
+plt.title("Validation velocity MSE")
+plt.savefig("val_mse_history.png")
+
+# ----------------- validation visualization -----------------
+
+x_vis, t_vis, v_target_vis = sample_batch(
+    jax.random.key(777),
+    data,
+    batch_size=1
+)
+
+v_pred_vis = model_vis(
+    x_vis[0],
+    t_vis[0]
+)
+
+plt.figure()
+plt.imshow(v_target_vis[0, 0], cmap="RdBu")
 plt.colorbar()
 plt.title("Target velocity")
-plt.show()
+plt.savefig("v_target.png")
 
 plt.figure()
-plt.imshow(v_pred[0, 0], cmap="RdBu")
+plt.imshow(v_pred_vis[0], cmap="RdBu")
 plt.colorbar()
 plt.title("Predicted velocity")
-plt.show()
+plt.savefig("v_pred.png")
 
-err = v_pred - v_target[0]
+err = v_pred_vis - v_target_vis[0]
 
 plt.figure()
 plt.imshow(err[0], cmap="RdBu")
 plt.colorbar()
 plt.title("Velocity error")
-plt.show()
+plt.savefig("err_vel.png")
+
+# ----------------- fixed sample generation for the different time steps------------------
+
+for step in checkpoint_steps:
+
+    model_step = load_model(step, template_model)
+
+    for i, noise in enumerate(fixed_noises):
+
+        x_gen = sample(model_step, noise, steps=100)
+
+        plt.figure()
+        plt.imshow(x_gen[0], cmap="RdBu")
+        plt.colorbar()
+        plt.title(f"step={step}, noise={i}")
+        plt.savefig(f"fixed_sample_step{step}_noise{i}.png")
+        plt.close()
