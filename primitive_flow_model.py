@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax 
 import glob
+import matplotlib.pyplot as plt
 
 
 
@@ -70,17 +71,19 @@ class Velocity_field_cnn(eqx.Module):
     )
 
   def __call__(self, x, t):
-    # shape of x (1, 64, 64)
+
+    t = t[:, :, None, None]
+
     x = x + t
 
-    h = jax.nn.silu(self.conv1(x))
-    h = jax.nn.silu(self.conv2(h))
-    h = jax.nn.silu(self.conv3(h))
-    h = jax.nn.silu(self.conv4(h))
+    def forward_single(xi):
+        h = jax.nn.silu(self.conv1(xi))
+        h = jax.nn.silu(self.conv2(h))
+        h = jax.nn.silu(self.conv3(h))
+        h = jax.nn.silu(self.conv4(h))
+        return self.conv5(h)
 
-    v = self.conv5(h)
-
-    return v
+    return jax.vmap(forward_single)(x)
 
 """### 1.2 Data generation
 Data batches are divided into single samples at the current time point t. The image x_t, time t itself and the target velocity v_target are returned.
@@ -126,7 +129,7 @@ def loss_function(model, x_t, t, v_target):
   
   v_pred = model(x_t, t)
 
-  return jnp.mean((v_target - v_prediction) ** 2)
+  return jnp.mean((v_target - v_pred) ** 2)
 
 """### 1.4 Training
 Using the optax library we set up the training of the model.
@@ -154,7 +157,7 @@ def sample(model, x, steps, modelname):
 
     for i in range(steps):
 
-      t = i / steps
+      t = jnp.array([[i / steps]])
 
       v = model(x, t)   # <-- v_theta(x_t)
 
@@ -169,14 +172,21 @@ def sample(model, x, steps, modelname):
 # ----------------- data import -------------------------------
 
 files = sorted(glob.glob("data/final_state_*.npy"))
-data = np.stack([np.load(f)[0] for f in files])     # only load the density data first
+# only load the density data first
+data = np.stack([np.load(f)[0] for f in files]) 
+small_data = data[:8]
+# normalize data
+mean = data.mean()
+std = data.std()
+data = (data - mean) / std 
+# put data in correct shape 
 data = data[:, None, :, :]
-print(data.shape)
 
 # ----------------- training loop ----------------------------
 
+# hyperparameters
 batch_size = 4
-num_steps = 10
+num_steps = 5000
 
 key = jax.random.key(0)
 
@@ -187,7 +197,9 @@ optimizer = optax.adam(learning_rate=1e-4)
 opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
 
-for step in range(num_steps):
+loss_history = []
+
+for step in range(num_steps+1):
 
     key, subkey = jax.random.split(key)
 
@@ -205,10 +217,90 @@ for step in range(num_steps):
         v_target
     )
 
+    loss_history.append(loss)
+    # print progress
     if step % 100 == 0:
         print(f"step {step}, loss {loss}")
 
-# test
-print(x_t.shape)
-print(t.shape)
-print(v_target.shape)
+
+# save the model parameters 
+
+eqx.tree_serialise_leaves(
+    "velocity_field.eqx",
+    model
+)
+
+# loading the model
+model = eqx.tree_deserialise_leaves(
+    "velocity_field.eqx",
+    model
+)
+
+# plot the loss
+plt.plot(loss_history)
+plt.yscale("log")  # very useful for flows
+plt.xlabel("step")
+plt.ylabel("loss")
+plt.title("Training loss (Flow Matching)")
+plt.show()
+
+# test sampling
+key = jax.random.key(42)
+x = jax.random.normal(
+    key, 
+    (256, 256)
+)
+
+x_gen = sample(
+    model,
+    x,
+    steps=100,
+    modelname=1 
+)
+
+plt.imshow(x_gen[0], origin="lower")
+plt.colorbar()
+plt.savefig('test_sample.png')
+
+
+# compare velocity prediction and target velocity
+key, subkey = jax.random.split(key)
+
+x_t, t, v_target = sample_batch(subkey, data, batch_size=8)
+
+v_pred = jax.vmap(lambda x, t_: model(x, t_))(x_t, t)
+
+mse = jnp.mean((v_pred - v_target) ** 2)
+
+print("velocity MSE:", mse)
+
+rel_error = jnp.mean((v_pred - v_target) ** 2) / jnp.mean(v_target ** 2)
+print("relative error:", rel_error)
+
+# plot target and prediction
+
+key, subkey = jax.random.split(key)
+
+x_t, t, v_target = sample_batch(subkey, data, batch_size=1)
+
+v_pred = model(x_t[0], t[0])
+
+plt.figure()
+plt.imshow(v_target[0, 0], cmap="RdBu")
+plt.colorbar()
+plt.title("Target velocity")
+plt.show()
+
+plt.figure()
+plt.imshow(v_pred[0, 0], cmap="RdBu")
+plt.colorbar()
+plt.title("Predicted velocity")
+plt.show()
+
+err = v_pred - v_target[0]
+
+plt.figure()
+plt.imshow(err[0], cmap="RdBu")
+plt.colorbar()
+plt.title("Velocity error")
+plt.show()
