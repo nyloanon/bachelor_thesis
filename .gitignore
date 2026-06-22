@@ -1,5 +1,10 @@
 /data
 /figures
-/tests
 /evaluation_plots
 /checkpoints
+/cnn_checkpoints
+/cnn_data
+/unet_checkpoints
+/unet_data
+/test.py
+/cnn_test.py

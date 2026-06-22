@@ -50,12 +50,13 @@ class Velocity_field_mlp(eqx.Module):
 
     return v.reshape(x.shape)
 
-"""### 3.1.2 CNN Model
+"""### 1.1.2 CNN Model
 Using the Equinox library and Jax a CNN velocity field on a 256x256 grid is set up. The activation function used in all hidden layers is the SiLu function: r"$\text{SiLu}(x) = x \cdot \sigma(x)$".
 """
 
 class Velocity_field_cnn(eqx.Module):
     
+    # set up 5 convolutional layers
     conv1: eqx.nn.Conv2d
     conv2: eqx.nn.Conv2d
     conv3: eqx.nn.Conv2d
@@ -82,17 +83,19 @@ class Velocity_field_cnn(eqx.Module):
             32, 1, kernel_size=3, padding=1, key=keys[4]
         )
 
+
     def __call__(self, x, t):
-        # x: (C, H, W)
+        # shape of x: (C, H, W)
 
         t_emb = jnp.array([t])  # scalar feature
         t_emb = jnp.broadcast_to(t_emb, (1, x.shape[1], x.shape[2]))
-        x = jnp.concatenate([x, t_emb], axis=0)
+        x = jnp.concatenate([x, t_emb], axis=0) # shape of x: (C, H, W)
 
         x = jax.nn.silu(self.conv1(x))
         x = jax.nn.silu(self.conv2(x))
         x = jax.nn.silu(self.conv3(x))
         x = jax.nn.silu(self.conv4(x))
+
         x = self.conv5(x)
 
         return x
@@ -109,7 +112,7 @@ def sample_batch(key, data, batch_size):
 
     def single_sample(k):
         
-        key1, key2, key3 = jax.random.split(k, 3)
+        key1, key2, key3, key4 = jax.random.split(k, 4)
 
         idx = jax.random.randint(key1, (), 0, len(data))
         
@@ -123,10 +126,15 @@ def sample_batch(key, data, batch_size):
         x0 = jax.random.normal(key2, x1.shape) # noise of same shape
 
         t = jax.random.uniform(key3, (1,))
-        
-        x_t = (1 - t) * x0 + t * x1
 
-        v_target = x1 - x0
+        eps = jax.random.normal(key4, x1.shape)
+        sigma_max = 1e-1
+        one = jnp.ones_like(t)
+        noise_t = sigma_max * t * (1 - t)
+        
+        x_t = (1 - t) * x0 + t * x1 + noise_t * eps  
+
+        v_target = x1 - x0 + sigma_max * (1 - 2 * t) 
         
         return x_t, t, v_target
     
@@ -193,25 +201,28 @@ def sample(model, x, steps, modelname=None):
 files = sorted(glob.glob("data/final_state_*.npy"))
 # only load the density data first
 data = np.stack([np.load(f)[0] for f in files]) 
-small_data = data[:500]
 # normalize data
 mean = data.mean()
 std = data.std()
 data = (data - mean) / std 
 # put data in correct shape 
 data = data[:, None, :, :]
+# use small data first
+small_data = data[:1000]
+
 
 # ----------------- training setup ----------------------------
 # hyperparameters
 batch_size = 16
-num_steps = 20000
+epochs = 20000
 
 key = jax.random.key(0)
 
 model = Velocity_field_cnn(key)
 
 # set learning rate
-optimizer = optax.adam(learning_rate=1e-4)
+learning_rate = 3e-4
+optimizer = optax.adam(learning_rate)
 opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
 # ----------------- fixed validation set ----------------------
@@ -220,7 +231,7 @@ val_key = jax.random.key(12345)
 
 x_val, t_val, v_val = sample_batch(
     val_key,
-    data,
+    small_data,
     batch_size=16
 )
 
@@ -240,13 +251,13 @@ loss_history = []
 val_mse_history = []
 checkpoint_steps = {2000, 5000, 10000, 20000}
 
-for step in range(num_steps + 1):
+for step in range(epochs + 1):
 
     key, subkey = jax.random.split(key)
 
     x_t, t, v_target = sample_batch(
         subkey,
-        data,
+        small_data,
         batch_size
     )
 
@@ -261,7 +272,7 @@ for step in range(num_steps + 1):
     loss_history.append(loss)
 
     # evaluate on fixed validation batch
-    if step % 100 == 0:
+    if step % 500 == 0:
 
         v_pred_val = jax.vmap(
             lambda x, t_: model(x, t_)
@@ -325,11 +336,11 @@ plt.savefig("val_mse_history.png")
 
 x_vis, t_vis, v_target_vis = sample_batch(
     jax.random.key(777),
-    data,
+    small_data,
     batch_size=1
 )
 
-v_pred_vis = model_vis(
+v_pred_vis = model(
     x_vis[0],
     t_vis[0]
 )
@@ -354,19 +365,38 @@ plt.colorbar()
 plt.title("Velocity error")
 plt.savefig("err_vel.png")
 
+
 # ----------------- fixed sample generation for the different time steps------------------
 
-for step in checkpoint_steps:
+# test
 
-    model_step = load_model(step, template_model)
+x_gen = sample(model, fixed_noises[0], 100, modelname=1)
+plt.figure()
+plt.imshow(x_gen[0], cmap="RdBu")
+plt.colorbar()
+plt.title("test generation")
+plt.savefig("test_generation.png")
+plt.close()
 
-    for i, noise in enumerate(fixed_noises):
+plt.figure()
+plt.imshow(fixed_noises[0][0], cmap="RdBu")
+plt.colorbar()
+plt.title("test noise")
+plt.savefig("test_noise.png")
+plt.close()
 
-        x_gen = sample(model_step, noise, steps=100)
+# for step in checkpoint_steps:
 
-        plt.figure()
-        plt.imshow(x_gen[0], cmap="RdBu")
-        plt.colorbar()
-        plt.title(f"step={step}, noise={i}")
-        plt.savefig(f"fixed_sample_step{step}_noise{i}.png")
-        plt.close()
+#     model_step = load_model(step, template_model)
+
+#     for i, noise in enumerate(fixed_noises):
+
+#         x_gen = sample(model_step, noise, steps=100)
+
+#         plt.figure()
+#         plt.imshow(x_gen[0], cmap="RdBu")
+#         plt.colorbar()
+#         plt.title(f"step={step}, noise={i}")
+#         plt.savefig(f"fixed_sample_step{step}_noise{i}.png")
+#         plt.close()
+
