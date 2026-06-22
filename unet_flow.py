@@ -138,14 +138,18 @@ class UNet(eqx.Module):
     
     down1: ConvBlock
     down2: ConvBlock
+    down3: ConvBlock
     bottleneck: ConvBlock
     up1: ConvBlock
     up2: ConvBlock
+    up3: ConvBlock
 
     downsample1: Down
     downsample2: Down
+    downsample3: Down
     upsample1: Up
     upsample2: Up
+    upsample3: Up
     
     t_mlp: eqx.Module
     t1: eqx.nn.Linear
@@ -154,7 +158,7 @@ class UNet(eqx.Module):
 
     def __init__(self, key):
 
-        keys = jax.random.split(key, 14)
+        keys = jax.random.split(key, 16)
 
         # encoder
         self.down1 = ConvBlock(64, 64, keys[0])
@@ -162,6 +166,9 @@ class UNet(eqx.Module):
 
         self.down2 = ConvBlock(64, 64, keys[2])
         self.downsample2 = Down(64, 64, keys[3])
+
+        self.down3 = ConvBlock(64, 64, keys[14])
+        self.downsample3 = Down(64, 64, keys[15])
 
         # bottleneck
         self.bottleneck = ConvBlock(64, 64, keys[4])
@@ -173,8 +180,11 @@ class UNet(eqx.Module):
         self.upsample2 = Up(64, 64, keys[7])
         self.up2 = ConvBlock(128, 64, keys[8])
 
+        self.upsample3 = Up(64, 64, keys[9])
+        self.up3 = ConvBlock(128, 64, keys[10])
+
         # time (probably wrong, and t1, t2 and t3 unecessary)
-        self.t_mlp = TimeMLP(64, 128, 64, key=keys[9])
+        self.t_mlp = TimeMLP(64, 128, 64, key=keys[11])
         self.t1 = eqx.nn.Linear(64, 128, key=keys[12])
 
         # output
@@ -192,20 +202,25 @@ class UNet(eqx.Module):
         x3 = self.down2(x2, t_global)
         x4 = self.downsample2(x3) # (64, 64, 64)
 
+        x5 = self.down3(x4, t_global)
+        x6 = self.downsample3(x5) #(64, 32, 32)
         # ---------- bottleneck ------------
-        x5 = self.bottleneck(x4, t_global) 
-
+        x7 = self.bottleneck(x6, t_global)
         # ---------- up --------------------
-        x = self.upsample1(x5)
+        x = self.upsample1(x7) #(64, 32, 32)
         # first skip connection
-        x = jnp.concatenate([x, x3], axis=0) # (128, 128, 128)
-        x = self.up1(x, t1) # (64, 128, 128)
+        x = jnp.concatenate([x, x5], axis=0) # (128, 32, 32)
+        x = self.up1(x, t1) # (64, 64, 64)
 
         x = self.upsample2(x)
         # second skip connection
-        x = jnp.concatenate([x, x1], axis=0) # (128, 256, 256)
-        x = self.up2(x, t1)
+        x = jnp.concatenate([x, x3], axis=0) # (128, 64, 64)
+        x = self.up2(x, t1) # (64, 128, 128)
 
+        x = self.upsample3(x)
+        # third skip connection
+        x = jnp.concatenate([x, x1], axis=0) # (128, 256, 256)
+        x = self.up3(x, t1)
         # ----------- output ----------------
         return self.final(x)
 
