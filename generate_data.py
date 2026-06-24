@@ -192,7 +192,7 @@ def random_khi_fourier_modes(
     return amplitude * envelope * fourier_sum
 
 """### 3 Data Generation
-In this step we generate the 64x64 KHI data which we train our model with. We went for _ images for a start.
+In this step we generate the 256x256 KHI data which we train our model with. We went for _ images for a start.
 """
 
 # Grid size and configuration
@@ -210,7 +210,7 @@ u_x = 0.5 * jnp.ones_like(X)
 
 # random initialization
 key = PRNGKey(0)
-num_sims = 1000
+num_sims = 100000
 
 # training data (num_sims x matrix of dim num_cells x num_cells)
 data = jnp.zeros((num_sims, num_cells.x, num_cells.x))
@@ -265,6 +265,6 @@ for i in range(num_sims):
       registered_variables,
   )
 
-  jnp.save(f"data/final_state_{i}", final_state)
+  jnp.save(f"100k_data/final_state_{i}", final_state)
   plt.imshow(final_state[0, :, :])
-  plt.savefig(f"figures/final_state{i}.png")
+  plt.savefig(f"100k_figures/final_state{i}.png")
