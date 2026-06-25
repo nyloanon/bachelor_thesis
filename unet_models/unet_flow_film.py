@@ -113,8 +113,8 @@ class ConvBlock(eqx.Module):
         # first film  conditioning
         film = self.film(t_emb)
         gamma, beta = jnp.split(film, 2, axis=-1)
-        gamma = 0.1 *  jnp.tanh(gamma)
-        beta = 0.1 * beta
+        gamma = 0.3 *  jnp.tanh(gamma)
+        beta = 0.3 * beta
         h = h + gamma[:, None, None] * h + beta[:, None, None] 
         
         # first silu
@@ -186,24 +186,24 @@ class UNet(eqx.Module):
         self.down1 = ConvBlock(1, 64, 64, keys[0])
         self.downsample1 = Down(64, 64, keys[1])
 
-        self.down2 = ConvBlock(64, 96, 64, keys[2])
-        self.downsample2 = Down(96, 96, keys[3])
+        self.down2 = ConvBlock(64, 64, 64, keys[2])
+        self.downsample2 = Down(64, 64, keys[3])
 
-        self.down3 = ConvBlock(96, 128, 64, keys[14])
-        self.downsample3 = Down(128, 128, keys[15])
+        self.down3 = ConvBlock(64, 64, 64, keys[14])
+        self.downsample3 = Down(64, 64, keys[15])
 
         # bottleneck
-        self.bottleneck = ConvBlock(128, 128, 64, keys[4])
+        self.bottleneck = ConvBlock(64, 64, 64, keys[4])
 
         # decoder
-        self.upsample1 = Up(128, 128, keys[5])
-        self.up1 = ConvBlock(256, 128, 64, keys[6])
+        self.upsample1 = Up(64, 64, keys[5])
+        self.up1 = ConvBlock(128, 64, 64, keys[6])
 
-        self.upsample2 = Up(128, 128, keys[7])
-        self.up2 = ConvBlock(224, 96, 64, keys[8])
+        self.upsample2 = Up(64, 64, keys[7])
+        self.up2 = ConvBlock(128, 64, 64, keys[8])
 
-        self.upsample3 = Up(96, 96, keys[9])
-        self.up3 = ConvBlock(160, 64, 64, keys[10])
+        self.upsample3 = Up(64, 64, keys[9])
+        self.up3 = ConvBlock(128, 64, 64, keys[10])
 
         # time 
         self.t_mlp = TimeMLP(64, 128, 64, key=keys[11])
@@ -218,29 +218,32 @@ class UNet(eqx.Module):
         # ---------- down -----------------
         x1 = self.down1(x, t_global)
         x2 = self.downsample1(x1) # (64, 128, 128)
-
+        
         x3 = self.down2(x2, t_global)
-        x4 = self.downsample2(x3) # (96, 64, 64)
+        x4 = self.downsample2(x3) # (64, 64, 64)
 
         x5 = self.down3(x4, t_global)
-        x6 = self.downsample3(x5) #(128, 32, 32)
+        x6 = self.downsample3(x5) #(64, 32, 32)
+
         # ---------- bottleneck ------------
-        x7 = self.bottleneck(x6, t_global) # (128, 32, 32)
+        x7 = self.bottleneck(x6, t_global) # (64, 32, 32)
         # ---------- up --------------------
-        x = self.upsample1(x7) #(128, 32, 32)
+        x = self.upsample1(x7) #(64, 32, 32)
+
         # first skip connection
-        x = jnp.concatenate([x, x5], axis=0) # (256, 32, 32)
-        x = self.up1(x, t_global) # (128, 64, 64)
-
+        x = jnp.concatenate([x, x5], axis=0) # (128, 32, 32)
+        x = self.up1(x, t_global) # (64, 64, 64)
         x = self.upsample2(x)
+        
         # second skip connection
-        x = jnp.concatenate([x, x3], axis=0) # (224, 64, 64)
-        x = self.up2(x, t_global) # (96, 128, 128)
-
+        x = jnp.concatenate([x, x3], axis=0) # (128, 128, 128)
+        x = self.up2(x, t_global) # (64, 128, 128)
         x = self.upsample3(x)
+    
         # third skip connection
-        x = jnp.concatenate([x, x1], axis=0) # (160, 128, 128)
+        x = jnp.concatenate([x, x1], axis=0) # (128, 256, 256)
         x = self.up3(x, t_global) # (64, 256, 256)
+        
         # ----------- output ----------------
         return self.final(x)
 
@@ -352,13 +355,13 @@ data = (data - mean) / std
 # put data in correct shape 
 data = data[:, None, :, :]
 # use small data first
-small_data = data
+small_data = data[:1000]
 
 
 # ----------------- training setup ----------------------------
 # hyperparameters
 batch_size = 16
-epochs = 10000
+epochs = 20000
 
 key = jax.random.key(0)
 
@@ -476,7 +479,7 @@ plt.savefig("val_mse_history.png")
 x_vis, t_vis, v_target_vis = sample_batch(
     jax.random.key(777),
     small_data,
-    batch_size=1
+    batch_size=16
 )
 
 v_pred_vis = model(
