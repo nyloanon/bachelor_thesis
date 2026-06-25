@@ -113,8 +113,8 @@ class ConvBlock(eqx.Module):
         # first film  conditioning
         film = self.film(t_emb)
         gamma, beta = jnp.split(film, 2, axis=-1)
-        gamma = 0.3 *  jnp.tanh(gamma)
-        beta = 0.3 * beta
+        gamma = 0.001 *  jnp.tanh(gamma)
+        beta = 0.001 * beta
         h = h + gamma[:, None, None] * h + beta[:, None, None] 
         
         # first silu
@@ -443,15 +443,6 @@ for step in range(epochs + 1):
             model
             )
             
-
-# ------------- test ---------------------------
-#------------------ load models -----------------------------
-
-def load_model(step, template_model):
-    return eqx.tree_deserialise_leaves(
-        f"unet_checkpoints/unet_velocity_field_{step}.eqx",
-        template_model
-    )
 
 # ----------------- plot training history --------------------
 
