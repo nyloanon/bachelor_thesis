@@ -5,20 +5,29 @@ autocvd(num_gpus=1)
 # =======================
 
 
-# imports
+# ==========================================================================
+#  import of libraries
+# ==========================================================================
 
-import numpy as np
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-import optax 
-import glob
-import matplotlib.pyplot as plt
 
-# saving models
-import os
-os.makedirs("unet_checkpoints", exist_ok=True)
+# ==========================================================================
+#  constants
+# ==========================================================================
 
+INPUT_CHANNELS = 4  #(density, velocity_x, velocity_y, pressure)
+BASE_CHANNELS = 96
+FOURIER_DIM = 32
+TIME_CHANNELS = FOURIER_DIM * 2
+SKIP_CHANNELS = 2*BASE_CHANNELS
+GROUPS = 8
+MAX_PERIOD = 1000
+
+# ==========================================================================
+#  Fourier time embedding
+# ==========================================================================
 
 """
 1. Time embedding
@@ -31,9 +40,8 @@ os.makedirs("unet_checkpoints", exist_ok=True)
 def fourier_embedding(t: float):
     
     # calculate frequencies 
-    i : int = 32
     d : int = 2
-    freqs: list[float] = [1000**(-k/d) for k in range(i)]
+    freqs: list[float] = [1000**(-k/d) for k in range(FOURIER_DIM)]
     freqs = jnp.array(freqs)
 
     # sin and cos values
@@ -77,6 +85,11 @@ class TimeMLP(eqx.Module):
 
         return x
 
+
+# ==========================================================================
+#  U-Net class
+# ==========================================================================
+
 """ 
 2. U-Net Implementation: 
     First the convolutional block, the down- and up-sampling are implemented as classes. Then the U-Net is implemented
@@ -100,8 +113,8 @@ class ConvBlock(eqx.Module):
         self.conv1 = eqx.nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, key=key1)
         self.conv2 = eqx.nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, key=key2)
         self.film = eqx.nn.Linear(t_dim, 2 * out_ch, key=key3)
-        self.norm1 = eqx.nn.GroupNorm(8, out_ch)
-        self.norm2 = eqx.nn.GroupNorm(8, out_ch)
+        self.norm1 = eqx.nn.GroupNorm(GROUPS, out_ch)
+        self.norm2 = eqx.nn.GroupNorm(GROUPS, out_ch)
     
     def __call__(self, x, t_emb):
         # first conv 
@@ -183,33 +196,33 @@ class UNet(eqx.Module):
         keys = jax.random.split(key, 16)
 
         # encoder
-        self.down1 = ConvBlock(1, 64, 64, keys[0])
-        self.downsample1 = Down(64, 64, keys[1])
+        self.down1 = ConvBlock(INPUT_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[0])
+        self.downsample1 = Down(BASE_CHANNELS, BASE_CHANNELS, keys[1])
 
-        self.down2 = ConvBlock(64, 64, 64, keys[2])
-        self.downsample2 = Down(64, 64, keys[3])
+        self.down2 = ConvBlock(BASE_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[2])
+        self.downsample2 = Down(BASE_CHANNELS, BASE_CHANNELS, keys[3])
 
-        self.down3 = ConvBlock(64, 64, 64, keys[14])
-        self.downsample3 = Down(64, 64, keys[15])
+        self.down3 = ConvBlock(BASE_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[14])
+        self.downsample3 = Down(BASE_CHANNELS, BASE_CHANNELS, keys[15])
 
         # bottleneck
-        self.bottleneck = ConvBlock(64, 64, 64, keys[4])
+        self.bottleneck = ConvBlock(BASE_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[4])
 
         # decoder
-        self.upsample1 = Up(64, 64, keys[5])
-        self.up1 = ConvBlock(128, 64, 64, keys[6])
+        self.upsample1 = Up(BASE_CHANNELS, BASE_CHANNELS, keys[5])
+        self.up1 = ConvBlock(SKIP_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[6])
 
-        self.upsample2 = Up(64, 64, keys[7])
-        self.up2 = ConvBlock(128, 64, 64, keys[8])
+        self.upsample2 = Up(BASE_CHANNELS, BASE_CHANNELS, keys[7])
+        self.up2 = ConvBlock(SKIP_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[8])
 
-        self.upsample3 = Up(64, 64, keys[9])
-        self.up3 = ConvBlock(128, 64, 64, keys[10])
+        self.upsample3 = Up(BASE_CHANNELS, BASE_CHANNELS, keys[9])
+        self.up3 = ConvBlock(SKIP_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[10])
 
         # time 
-        self.t_mlp = TimeMLP(64, 128, 64, key=keys[11])
+        self.t_mlp = TimeMLP(TIME_CHANNELS, TIME_CHANNELS*2, TIME_CHANNELS, key=keys[11])
 
         # output
-        self.final = eqx.nn.Conv2d(64, 1, 1, key=keys[13])
+        self.final = eqx.nn.Conv2d(BASE_CHANNELS, INPUT_CHANNELS, 1, key=keys[13])
 
     def __call__(self, x, t):
         #----------- time ----------------
@@ -247,300 +260,17 @@ class UNet(eqx.Module):
         # ----------- output ----------------
         return self.final(x)
 
-        
-"""### 2. Data generation
-Data batches are divided into single samples at the current time point t. The image x_t, time t itself and the target velocity v_target are returned.
-"""
-
-
-def sample_batch(key, data, batch_size):
-
-    keys = jax.random.split(key, batch_size)
-
-    def single_sample(k):
-        
-        key1, key2, key3 = jax.random.split(k, 3)
-
-        idx = jax.random.randint(key1, (), 0, len(data))
-        
-        x1 = jax.lax.dynamic_index_in_dim(
-            data,
-            idx,
-            axis=0,
-            keepdims=False
-        )           # real KHI
-
-        x0 = jax.random.normal(key2, x1.shape)  # noise
-
-        t = jax.random.uniform(key3, ())
-
-        x_t = (1 - t) * x0 + t * x1
-
-        v_target = x1 - x0   # clean rectified flow direction
-        
-        return x_t, t, v_target
-    
-    x_t, t, v_target = jax.vmap(single_sample)(keys)
-
-    return x_t, t, v_target
-
-"""### 3. Loss function
-For the loss a simple mean squared error is implemented.
-"""
-
-def loss_function(model, x_t, t, v_target):
-
-    batched_model = jax.vmap(model, in_axes=(0, 0))
-
-    v_pred = batched_model(x_t, t)
-
-    return jnp.mean((v_pred - v_target) ** 2)
-
-"""### 4. Training
-Using the optax library we set up the training of the model.
-"""
-
-@eqx.filter_jit
-def train_step(model, opt_state, x_t, t, v_target):
-
-  loss, grads = eqx.filter_value_and_grad(loss_function)(model, x_t, t, v_target)
-
-  updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
-
-  model = eqx.apply_updates(model, updates)
-
-  return model, opt_state, loss
-
-"""### 5. Sampling"""
-
-def sample(model, x, steps):
-
-    dt = 1.0 / steps
-
-    x_result = []
-
-    for i in range(steps):
-
-        t = i / steps
-
-        # velocity at current state
-        v1 = model(x, t)
-
-        # Euler prediction
-        x_euler = x + dt * v1
-
-        # next time (clamped to training range)
-        t_next = min(t + dt, 1.0)
-
-        # velocity at predicted state
-        v2 = model(x_euler, t_next)
-
-        # Heun update
-        x = x + dt * 0.5 * (v1 + v2)
-
-        if i % 10 == 0:
-            x_result.append(x)
-
-    return x_result
-
-# ----------------- data import -------------------------------
-
-files = sorted(glob.glob("data/final_state_*.npy"))
-# only load the density data first
-data = np.stack([np.load(f)[0] for f in files]) 
-# normalize data
-mean = data.mean()
-std = data.std()
-data = (data - mean) / std 
-# put data in correct shape 
-data = data[:, None, :, :]
-# use small data first
-small_data = data[:1000]
-
-
-# ----------------- training setup ----------------------------
-# hyperparameters
-batch_size = 16
-epochs = 20000
-
-key = jax.random.key(0)
-
-model = UNet(key)
-
-# set learning rate
-learning_rate = 3e-4
-optimizer = optax.adam(learning_rate)
-opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-
-# ----------------- fixed validation set ----------------------
-
-val_key = jax.random.key(12345)
-
-x_val, t_val, v_val = sample_batch(
-    val_key,
-    small_data,
-    batch_size=16
-)
-
-# ----------------- fixed sample noises -----------------------
-
-noise_key = jax.random.key(999)
-fixed_noises = jax.random.split(noise_key, 4)
-
-fixed_noises = [
-    jax.random.normal(k, (1, 256, 256))
-    for k in fixed_noises
-]
-
-# ----------------- training loop -----------------------------
-
-loss_history = []
-val_mse_history = []
-checkpoint_steps = {10000, 20000, 30000, 40000, 50000}
-
-for step in range(epochs + 1):
-
-    key, subkey = jax.random.split(key)
-
-    x_t, t, v_target = sample_batch(
-        subkey,
-        small_data,
-        batch_size
-    )
-
-    model, opt_state, loss = train_step(
-        model,
-        opt_state,
-        x_t,
-        t,
-        v_target
-    )
-
-    # evaluate on fixed validation batch
-    if step % 1000 == 0:
-
-        v_pred_val = jax.vmap(
-            lambda x, t_: model(x, t_)
-        )(x_val, t_val)
-
-        val_mse = jnp.mean(
-            (v_pred_val - v_val) ** 2
-        )
-
-        val_mse_history.append(val_mse)
-        
-        loss_history.append(loss)
-
-        print(
-            f"step {step}, "
-            f"train loss {loss:.4f}, "
-            f"val mse {val_mse:.4f}"
-        )
-
-        if step in checkpoint_steps:
-            eqx.tree_serialise_leaves(
-            f"unet_checkpoints/unet_velocity_field_{step}.eqx",
-            model
-            )
-            
-
-# ----------------- plot training history --------------------
-
-plt.figure()
-plt.plot(loss_history)
-plt.yscale("log")
-plt.xlabel("step")
-plt.ylabel("loss")
-plt.title("Training loss")
-plt.savefig("loss_history.png")
-
-plt.figure()
-plt.plot(
-    np.arange(len(val_mse_history)) * 100,
-    val_mse_history
-)
-plt.yscale("log")
-plt.xlabel("step")
-plt.ylabel("validation MSE")
-plt.title("Validation velocity MSE")
-plt.savefig("val_mse_history.png")
-
-# ----------------- validation visualization -----------------
-
-x_vis, t_vis, v_target_vis = sample_batch(
-    jax.random.key(777),
-    small_data,
-    batch_size=16
-)
-
-v_pred_vis = model(
-    x_vis[0],
-    t_vis[0]
-)
-
-plt.figure()
-plt.imshow(v_target_vis[0, 0], cmap="RdBu")
-plt.colorbar()
-plt.title("Target velocity")
-plt.savefig("v_target.png")
-
-plt.figure()
-plt.imshow(v_pred_vis[0], cmap="RdBu")
-plt.colorbar()
-plt.title("Predicted velocity")
-plt.savefig("v_pred.png")
-
-err = v_pred_vis - v_target_vis[0]
-
-plt.figure()
-plt.imshow(err[0], cmap="RdBu")
-plt.colorbar()
-plt.title("Velocity error")
-plt.savefig("err_vel.png")
-
-
-# ----------------- fixed sample generation for the different time steps------------------
-
-x_gen_1 = sample(model, fixed_noises[0], 100)
-plt.figure()
-plt.imshow(x_gen_1[-1][0], cmap="RdBu")
-plt.colorbar()
-plt.title("test generationv1, step 100")
-plt.savefig("test_generationv1_100.png")
-plt.close()
-
-plt.figure()
-plt.imshow(x_gen_1[5][0], cmap="RdBu")
-plt.colorbar()
-plt.title("test generationv1, step 60")
-plt.savefig("test_generationv1_60.png")
-plt.close()
-
-plt.figure()
-plt.imshow(fixed_noises[0][0], cmap="RdBu")
-plt.colorbar()
-plt.title("test noise")
-plt.savefig("test_noisev1.png")
-plt.close()
-
-x_gen_2 = sample(model, fixed_noises[1], 100)
-plt.figure()
-plt.imshow(x_gen_2[-1][0], cmap="RdBu")
-plt.colorbar()
-plt.title("test generationv2, step 100")
-plt.savefig("test_generationv2_100.png")
-plt.close()
-
-plt.figure()
-plt.imshow(x_gen_2[5][0], cmap="RdBu")
-plt.colorbar()
-plt.title("test generationv2, step 60")
-plt.savefig("test_generationv2_60.png")
-plt.close()
-
-plt.figure()
-plt.imshow(fixed_noises[1][0], cmap="RdBu")
-plt.colorbar()
-plt.title("test noise")
-plt.savefig("test_noisev2.png")
-plt.close()
+# ==========================================================================
+#  saving, loading and creation of models
+# ==========================================================================
+
+def create_model(key):
+    model = UNet(key)
+    return model
+
+def save_model(model: UNet, filepath: str):
+    eqx.tree_serialise_leaves(filepath, model)
+
+def load_model(filepath: str, key):
+    model = UNet(key)
+    return eqx.tree_deserialise_leaves(filepath, model)

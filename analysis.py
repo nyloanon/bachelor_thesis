@@ -5,9 +5,11 @@ autocvd(num_gpus=1)
 # =======================
 
 import jax.numpy as jnp
+import numpy as np
 import math
 import glob
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 # ==========================================================================
@@ -140,11 +142,10 @@ def get_kinetic_energy_spectrum(vx, vy, rho, binning=PHYSICAL_BINNING):
 def rho_power_spectrum(rho):
     """
     Compute the power spectrum P(k) for density.
-    rho.shape = (n_data, 1, 256, 256)
+    rho.shape = (n_data, 256, 256)
     return a list containing the power spectrum for all data
     """
 
-    rho = rho[:, 0, :, :]
     rho = rho - rho.mean(axis=(-2, -1), keepdims=True)
     n_data, N, _ = rho.shape
 
@@ -184,6 +185,25 @@ def rho_power_spectrum(rho):
     return k_centers, jnp.stack(Pk_all)
 
 
+def density_distribution(rho_gen, rho_real):
+    """
+    Create and plot a density distribution for comparison of p(rho_real) and p(rho_gen).
+    rho_gen.shape = (n_data, 256, 256)
+    rho_real.shape = (n_data, 256, 256)
+    """
+
+    # flatten data for seaborn distplot
+    rho_gen = rho_gen.flatten()
+    rho_real = rho_real.flatten()
+
+    fig, ax = plt.subplots()
+    sns.kdeplot(rho_real, ax=ax, label="real data")
+    sns.kdeplot(rho_gen, ax=ax, color="r", label="generated data")
+    plt.xlabel("$\\rho$")
+    plt.ylabel("$P(\\rho)$")
+    plt.legend()
+    plt.savefig("sns_distplot.png")
+    
 # ==========================================================================
 #  Statistical analysis
 # ==========================================================================
@@ -203,32 +223,14 @@ def calculate_fid(x, y):
 
 
 # ==========================================================================
-#  Model import
-# ==========================================================================
-
-def load_model(step, template_model):
-    return eqx.tree_deserialise_leaves(
-        f"unet_checkpoints/unet_velocity_field_{step}.eqx",
-        template_model
-    )
-
-
-# ==========================================================================
 #  Data import 
 # ==========================================================================
 
-files = sorted(glob.glob("data/final_state_*.npy"))
-rhos_real = jnp.stack([jnp.load(files[i])[0] for i in range(1000)]) #(1000, 256, 256)
-rhos_real = rhos_real[:, None, :, :]
+files = sorted(glob.glob("unet_generations/test_generation_*.npy"))
 
-k_centers, Pk_results = rho_power_spectrum(rhos_real)
+generations = np.stack([np.load(f)for f in files]) 
+print(generations.shape)
 
-Pk_mean = Pk_results.mean(axis=0)
-Pk_std = Pk_results.std(axis=0)
-
-plt.figure()
-plt.plot(k_centers, Pk_results[0])
-plt.yscale('log')
-plt.xscale('log')
-plt.savefig("test.png")
-
+k_centers, Pk_all = rho_power_spectrum(generations)
+plt.plot(k_centers, Pk_all[0])
+plt.savefig('power_spec_test.png')
