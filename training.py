@@ -102,14 +102,13 @@ def train_step(model, opt_state, x_t, t, v_target):
 #  data import
 # ==========================================================================
 
-files = sorted(glob.glob("data/final_state_*.npy"))
+files = sorted(glob.glob("100k_data/final_state_*.npy"))
 
 # only load the density data first
 rho = np.stack([np.load(f)[0] for f in files]) 
 v_x = np.stack([np.load(f)[1] for f in files]) 
 v_y = np.stack([np.load(f)[2] for f in files]) 
 p = np.stack([np.load(f)[3] for f in files]) 
-print(rho.shape)
 
 # normalize data
 rho = (rho - rho.mean()) / rho.std()
@@ -117,10 +116,20 @@ v_x = (v_x - v_x.mean()) / v_x.std()
 v_y = (v_y - v_y.mean()) / v_y.std()
 p = (p - p.mean()) / p.std()
 
+print(rho.mean(), rho.std())
+print(v_x.mean(), v_x.std())
+print(v_y.mean(), v_y.std())
+print(p.mean(), p.std())
+
 # put data in correct shape 
 data = jnp.stack([rho, v_x, v_y, p], axis=1)
-print(data.shape)
+small_data = data[:4500]
 
+# just density for trouble shooting
+
+rho_small = rho[:4500]
+rho_small = rho_small[:, None, : , :]
+print(rho_small.shape)
 
 # ==========================================================================
 #  training setup
@@ -128,7 +137,7 @@ print(data.shape)
 
 # hyperparameters
 batch_size = 16
-epochs = 50000
+epochs = 20000
 
 # set up model
 key_model = jax.random.key(10)
@@ -144,7 +153,7 @@ val_key = jax.random.key(12345)
 
 x_val, t_val, v_val = sample_batch(
     val_key,
-    data,
+    rho_small,
     batch_size=16
 )
 
@@ -163,7 +172,7 @@ for step in range(epochs + 1):
 
     x_t, t, v_target = sample_batch(
         subkey,
-        data,
+        rho_small,
         batch_size
     )
 
@@ -192,7 +201,7 @@ for step in range(epochs + 1):
 
         print(
             f"step {step}, "
-            f"train loss {loss:.4f}, "
+            f"train loss, density {loss:.4f},"
             f"val mse {val_mse:.4f}"
         )
 

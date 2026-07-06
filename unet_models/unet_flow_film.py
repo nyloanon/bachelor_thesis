@@ -17,8 +17,8 @@ import equinox as eqx
 #  constants
 # ==========================================================================
 
-INPUT_CHANNELS = 4  #(density, velocity_x, velocity_y, pressure)
-BASE_CHANNELS = 96
+INPUT_CHANNELS = 1  #(density, velocity_x, velocity_y, pressure)
+BASE_CHANNELS = 64
 FOURIER_DIM = 32
 TIME_CHANNELS = FOURIER_DIM * 2
 SKIP_CHANNELS = 2*BASE_CHANNELS
@@ -172,20 +172,38 @@ class Up(eqx.Module):
 
 class UNet(eqx.Module):
     
-    down1: ConvBlock
-    down2: ConvBlock
-    down3: ConvBlock
+    down10: ConvBlock
+    down11: ConvBlock
+    down20: ConvBlock
+    down21: ConvBlock
+    down30: ConvBlock
+    down31: ConvBlock
+    down40: ConvBlock
+    down41: ConvBlock
+    down50: ConvBlock
+    down51: ConvBlock
     bottleneck: ConvBlock
-    up1: ConvBlock
-    up2: ConvBlock
-    up3: ConvBlock
+    up10: ConvBlock
+    up11: ConvBlock
+    up20: ConvBlock
+    up21: ConvBlock
+    up30: ConvBlock
+    up31: ConvBlock
+    up40: ConvBlock
+    up41: ConvBlock
+    up50: ConvBlock
+    up51: ConvBlock
 
     downsample1: Down
     downsample2: Down
     downsample3: Down
+    downsample4: Down
+    downsample5: Down
     upsample1: Up
     upsample2: Up
     upsample3: Up
+    upsample4: Up
+    upsample5: Up
     
     t_mlp: eqx.Module
 
@@ -193,30 +211,52 @@ class UNet(eqx.Module):
 
     def __init__(self, key):
 
-        keys = jax.random.split(key, 16)
+        keys = jax.random.split(key, 34)
 
         # encoder
-        self.down1 = ConvBlock(INPUT_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[0])
+        self.down10 = ConvBlock(INPUT_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[0])
+        self.down11 = ConvBlock(BASE_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[24])
         self.downsample1 = Down(BASE_CHANNELS, BASE_CHANNELS, keys[1])
 
-        self.down2 = ConvBlock(BASE_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[2])
-        self.downsample2 = Down(BASE_CHANNELS, BASE_CHANNELS, keys[3])
+        self.down20 = ConvBlock(BASE_CHANNELS, BASE_CHANNELS*2, TIME_CHANNELS, keys[2])
+        self.down21 = ConvBlock(BASE_CHANNELS*2, BASE_CHANNELS*2, TIME_CHANNELS, keys[25])
+        self.downsample2 = Down(BASE_CHANNELS*2, BASE_CHANNELS*2, keys[3])
 
-        self.down3 = ConvBlock(BASE_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[14])
-        self.downsample3 = Down(BASE_CHANNELS, BASE_CHANNELS, keys[15])
+        self.down30 = ConvBlock(BASE_CHANNELS*2, BASE_CHANNELS*2, TIME_CHANNELS, keys[14])
+        self.down31 = ConvBlock(BASE_CHANNELS*2, BASE_CHANNELS*2, TIME_CHANNELS, keys[26])
+        self.downsample3 = Down(BASE_CHANNELS*2, BASE_CHANNELS*2, keys[15])
+
+        self.down40 = ConvBlock(BASE_CHANNELS*2, BASE_CHANNELS*2, TIME_CHANNELS, keys[16])
+        self.down41 = ConvBlock(BASE_CHANNELS*2, BASE_CHANNELS*4, TIME_CHANNELS, keys[27])
+        self.downsample4 = Down(BASE_CHANNELS*4, BASE_CHANNELS*4, keys[17])
+
+        self.down50 = ConvBlock(BASE_CHANNELS*4, BASE_CHANNELS*4, TIME_CHANNELS, keys[20])
+        self.down51 = ConvBlock(BASE_CHANNELS*4, BASE_CHANNELS*8, TIME_CHANNELS, keys[28])
+        self.downsample5 = Down(BASE_CHANNELS*8, BASE_CHANNELS*8, keys[21])
 
         # bottleneck
-        self.bottleneck = ConvBlock(BASE_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[4])
+        self.bottleneck = ConvBlock(BASE_CHANNELS*8, BASE_CHANNELS*8, TIME_CHANNELS, keys[4])
 
         # decoder
-        self.upsample1 = Up(BASE_CHANNELS, BASE_CHANNELS, keys[5])
-        self.up1 = ConvBlock(SKIP_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[6])
+        self.upsample1 = Up(BASE_CHANNELS*8, BASE_CHANNELS*8, keys[5])
+        self.up10 = ConvBlock(SKIP_CHANNELS*8, BASE_CHANNELS*8, TIME_CHANNELS, keys[6])
+        self.up11 = ConvBlock(BASE_CHANNELS*8, BASE_CHANNELS*8, TIME_CHANNELS, keys[29])
 
-        self.upsample2 = Up(BASE_CHANNELS, BASE_CHANNELS, keys[7])
-        self.up2 = ConvBlock(SKIP_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[8])
+        self.upsample2 = Up(BASE_CHANNELS*8, BASE_CHANNELS*8, keys[7])
+        self.up20 = ConvBlock(SKIP_CHANNELS*6, BASE_CHANNELS*4, TIME_CHANNELS, keys[8])
+        self.up21 = ConvBlock(BASE_CHANNELS*4, BASE_CHANNELS*4, TIME_CHANNELS, keys[30])
 
-        self.upsample3 = Up(BASE_CHANNELS, BASE_CHANNELS, keys[9])
-        self.up3 = ConvBlock(SKIP_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[10])
+        self.upsample3 = Up(BASE_CHANNELS*4, BASE_CHANNELS*4, keys[9])
+        self.up30 = ConvBlock(SKIP_CHANNELS*3, BASE_CHANNELS*2, TIME_CHANNELS, keys[10])
+        self.up31 = ConvBlock(BASE_CHANNELS*2, BASE_CHANNELS*2, TIME_CHANNELS, keys[31])
+
+        self.upsample4 = Up(BASE_CHANNELS*2, BASE_CHANNELS*2, keys[18])
+        self.up40 = ConvBlock(SKIP_CHANNELS*2, BASE_CHANNELS*2, TIME_CHANNELS, keys[19])
+        self.up41 = ConvBlock(BASE_CHANNELS*2, BASE_CHANNELS*2, TIME_CHANNELS, keys[32])
+
+        self.upsample5 = Up(BASE_CHANNELS*2, BASE_CHANNELS*2, keys[22])
+        self.up50 = ConvBlock(int(SKIP_CHANNELS*1.5), BASE_CHANNELS, TIME_CHANNELS, keys[23])
+        self.up51 = ConvBlock(BASE_CHANNELS, BASE_CHANNELS, TIME_CHANNELS, keys[33])
 
         # time 
         self.t_mlp = TimeMLP(TIME_CHANNELS, TIME_CHANNELS*2, TIME_CHANNELS, key=keys[11])
@@ -229,34 +269,64 @@ class UNet(eqx.Module):
         t_global = self.t_mlp(fourier_embedding(t)) # (64,)
 
         # ---------- down -----------------
-        x1 = self.down1(x, t_global)
-        x2 = self.downsample1(x1) # (64, 128, 128)
+        x1 = self.down10(x, t_global)
+        x1_ = self.down11(x1, t_global)
+        x2 = self.downsample1(x1_) # (64, 128, 128)
         
-        x3 = self.down2(x2, t_global)
-        x4 = self.downsample2(x3) # (64, 64, 64)
+        x3 = self.down20(x2, t_global)
+        x3_ = self.down21(x3, t_global)
+        x4 = self.downsample2(x3_) # (128, 64, 64)
 
-        x5 = self.down3(x4, t_global)
-        x6 = self.downsample3(x5) #(64, 32, 32)
+        x5 = self.down30(x4, t_global)
+        x5_ = self.down31(x5, t_global)
+        x6 = self.downsample3(x5_) # (128, 32, 32)
+
+        x7 = self.down40(x6, t_global)
+        x7_ = self.down41(x7, t_global)
+        x8 = self.downsample4(x7_) # (256, 16, 16)
+
+        x9 = self.down50(x8, t_global) 
+        x9_ = self.down51(x9, t_global)
+        x10 = self.downsample5(x9_) # (512, 8, 8)
 
         # ---------- bottleneck ------------
-        x7 = self.bottleneck(x6, t_global) # (64, 32, 32)
+        x11 = self.bottleneck(x10, t_global) # (512, 8, 8)
         # ---------- up --------------------
-        x = self.upsample1(x7) #(64, 32, 32)
+        x = self.upsample1(x11) #(512, 16, 16)
 
         # first skip connection
-        x = jnp.concatenate([x, x5], axis=0) # (128, 32, 32)
-        x = self.up1(x, t_global) # (64, 64, 64)
+        x = jnp.concatenate([x, x9_], axis=0) # (1024, 32, 32)
+        x = self.up10(x, t_global) # (512, 64, 64)
+        x = self.up11(x, t_global)
+        
         x = self.upsample2(x)
         
         # second skip connection
-        x = jnp.concatenate([x, x3], axis=0) # (128, 128, 128)
-        x = self.up2(x, t_global) # (64, 128, 128)
+        x = jnp.concatenate([x, x7_], axis=0) # (768, 128, 128)
+        x = self.up20(x, t_global) # (256, 128, 128)
+        x = self.up21(x, t_global)
+        
         x = self.upsample3(x)
     
         # third skip connection
-        x = jnp.concatenate([x, x1], axis=0) # (128, 256, 256)
-        x = self.up3(x, t_global) # (64, 256, 256)
+        x = jnp.concatenate([x, x5_], axis=0) # (384, 256, 256)
+        x = self.up30(x, t_global) # (128, 256, 256)
+        x = self.up31(x, t_global)
         
+        x = self.upsample4(x)
+        
+        # fourth skip connection
+        x = jnp.concatenate([x, x3_], axis=0) # (256, 256, 256)
+        x = self.up40(x, t_global) # (128, 256, 256)
+        x = self.up41(x, t_global)
+
+        x = self.upsample5(x)
+
+        # fifth skip connection
+        x = jnp.concatenate([x, x1_], axis=0) # (, 256, 256)
+        x = self.up50(x, t_global) # (64, 256, 256)
+        x = self.up51(x, t_global)
+
         # ----------- output ----------------
         return self.final(x)
 
