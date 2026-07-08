@@ -1,3 +1,8 @@
+# ==== GPU / XLA memory config (must precede any jax import) ====
+import os as _os
+# allocation of GPU memory on demand rather than grabbing ca. 75% up front
+_os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 # ==== GPU selection ====
 from autocvd import autocvd
 autocvd(num_gpus=1)
@@ -19,6 +24,10 @@ autocvd(num_gpus=1)
 #    list of widths so there is no fragile hand-tuned channel arithmetic.
 # ==========================================================================
 
+# ==========================================================================
+#  import of libraries
+# ==========================================================================
+
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -27,107 +36,163 @@ import equinox as eqx
 #  constants
 # ==========================================================================
 
-INPUT_CHANNELS = 4          # density, velocity_x, velocity_y, pressure
-WIDTHS = (64, 128, 256, 384)  # encoder stage widths (resolutions 256,128,64,32)
-BOTTLENECK = 512            # bottleneck width (resolution 16)
+INPUT_CHANNELS = 1  #(density, velocity_x, velocity_y, pressure)
+WIDTHS = (64, 128, 256, 384)
+BOTTLENECK = 512
 FOURIER_DIM = 32
-TIME_CHANNELS = FOURIER_DIM * 2   # dim of the raw fourier embedding
-TIME_EMB = 256              # dim of the processed time embedding fed to FiLM
+TIME_CHANNELS = FOURIER_DIM * 2
+TIME_EMB = 256
 GROUPS = 8
 MAX_PERIOD = 1000.0
 
+# Gradient checkpointing (rematerialization): recompute ResBlock activations in
+# the backward pass instead of storing them. Cuts peak activation memory ~2-4x
+# for ~30% extra compute, so training fits even on a partly-occupied GPU.
+# Disable with the environment variable KHI_CHECKPOINT=0.
+USE_CHECKPOINT = _os.environ.get("KHI_CHECKPOINT", "1") != "0"
 
 # ==========================================================================
 #  Fourier time embedding
 # ==========================================================================
 
-def fourier_embedding(t):
-    """DDPM-style sinusoidal embedding of a scalar time t in [0, 1]."""
-    d = 2
+"""
+1. Time embedding
+"""
+
+"""
+1.1 Fourier embedding: frequency values follow DDPM scheme 
+"""
+
+def fourier_embedding(t: float):
+    # calculate frequencies and angles
+    d : int = 2
     freqs = jnp.array([MAX_PERIOD ** (-k / d) for k in range(FOURIER_DIM)])
     angles = freqs * t
-    return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)])
 
+    return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)])
+    
+
+"""
+1.2 MLP for time embedding: 
+    MLP learns which frequencies are important
+"""
 
 class TimeMLP(eqx.Module):
-    """Learns which fourier frequencies matter for conditioning."""
-    l1: eqx.nn.Linear
-    l2: eqx.nn.Linear
+
+    mlp: list
 
     def __init__(self, in_dim, hidden_dim, out_dim, key):
+
         key1, key2 = jax.random.split(key)
-        self.l1 = eqx.nn.Linear(in_dim, hidden_dim, key=key1)
-        self.l2 = eqx.nn.Linear(hidden_dim, out_dim, key=key2)
+
+        self.mlp = [
+            eqx.nn.Linear(in_dim, hidden_dim, key=key1),
+            eqx.nn.Linear(hidden_dim, out_dim, key=key2)
+        ]
 
     def __call__(self, t):
-        h = jax.nn.silu(self.l1(t))
-        return self.l2(h)
+        x = jax.nn.silu(self.mlp[0](t))
+        
+        return self.mlp[1](x)
 
 
 # ==========================================================================
-#  Residual block with FiLM time conditioning
+#  Classes for U-Net 
 # ==========================================================================
+
+""" 
+2. U-Net Implementation: 
+    First the Residual block, the down- and up-sampling are implemented as classes.
+"""
+
+"""
+2.1 ResBlock, Down and Up
+"""
 
 class ResBlock(eqx.Module):
+
     norm1: eqx.nn.GroupNorm
     conv1: eqx.nn.Conv2d
     norm2: eqx.nn.GroupNorm
     conv2: eqx.nn.Conv2d
     film: eqx.nn.Linear
-    skip: eqx.Module   # Conv2d (1x1) or Identity
+    skip: eqx.Module # Conv2d (1x1) or Identity depending on in_dim and out_dim  
 
     def __init__(self, in_ch, out_ch, t_dim, key):
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        key1, key2, key3, key4 = jax.random.split(key, 4)
+        
         self.norm1 = eqx.nn.GroupNorm(GROUPS, in_ch)
-        self.conv1 = eqx.nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, key=k1)
+        self.conv1 = eqx.nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, key=key1)
         self.norm2 = eqx.nn.GroupNorm(GROUPS, out_ch)
-        self.conv2 = eqx.nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, key=k2)
-        # FiLM produces a per-channel (scale, shift) pair
-        self.film = eqx.nn.Linear(t_dim, 2 * out_ch, key=k3)
+        self.conv2 = eqx.nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, key=key2)
+        # FiLM shifts and scales in pairs per-channel
+        self.film = eqx.nn.Linear(t_dim, 2 * out_ch, key=key3)
         if in_ch == out_ch:
             self.skip = eqx.nn.Identity()
         else:
-            self.skip = eqx.nn.Conv2d(in_ch, out_ch, kernel_size=1, key=k4)
+            self.skip = eqx.nn.Conv2d(in_ch, out_ch, kernel_size=1, key=key4)
 
     def __call__(self, x, t_emb):
         h = self.conv1(jax.nn.silu(self.norm1(x)))
 
-        scale, shift = jnp.split(self.film(t_emb), 2, axis=-1)
+        # FiLM 
+        scale, shift = jnp.split(self.film(t_emb), 2, axis=1)
         h = self.norm2(h)
         h = h * (1.0 + scale[:, None, None]) + shift[:, None, None]
         h = self.conv2(jax.nn.silu(h))
 
         return h + self.skip(x)
 
-
 class Downsample(eqx.Module):
+    
     conv: eqx.nn.Conv2d
 
     def __init__(self, ch, key):
         self.conv = eqx.nn.Conv2d(ch, ch, kernel_size=4, stride=2, padding=1, key=key)
-
+    
     def __call__(self, x):
         return self.conv(x)
 
-
 class Upsample(eqx.Module):
-    conv: eqx.nn.Conv2d
+
+    conv : eqx.nn.Conv2d
 
     def __init__(self, ch, key):
         self.conv = eqx.nn.Conv2d(ch, ch, kernel_size=3, padding=1, key=key)
 
     def __call__(self, x):
         x = jax.image.resize(
-            x, (x.shape[0], x.shape[1] * 2, x.shape[2] * 2), method="bilinear"
-        )
+            x, 
+            (x.shape[0], x.shape[1] * 2, x.shape[2] * 2), 
+            method="bilinear"
+            )
         return self.conv(x)
 
+# ==========================================================================
+#  checkpointed block runner
+# ==========================================================================
+
+def _run_block(block, x, t_emb):
+    return block(x, t_emb)
+
+# Rematerialized variant: forward activations inside the block are recomputed
+# during the backward pass rather than stored. filter_checkpoint treats the
+# block's weight arrays as differentiable inputs, so gradients still flow.
+_run_block_ckpt = eqx.filter_checkpoint(_run_block)
+
+
+def run_block(block, x, t_emb):
+    if USE_CHECKPOINT:
+        return _run_block_ckpt(block, x, t_emb)
+    return _run_block(block, x, t_emb)
+
 
 # ==========================================================================
-#  U-Net
-# ==========================================================================
+#  U-Net architecture 
+# ==========================================================================    
 
 class UNet(eqx.Module):
+    
     in_conv: eqx.nn.Conv2d
     down_blocks: list
     downsamples: list
@@ -140,56 +205,64 @@ class UNet(eqx.Module):
     out_conv: eqx.nn.Conv2d
 
     def __init__(self, key):
+
         keys = iter(jax.random.split(key, 64))
 
         widths = list(WIDTHS)
-        self.in_conv = eqx.nn.Conv2d(INPUT_CHANNELS, widths[0], 3, padding=1, key=next(keys))
+        self.in_conv = eqx.nn.Conv2d(INPUT_CHANNELS, widths[0], kernel_size=3, padding=1, key=next(keys))
         self.t_mlp = TimeMLP(TIME_CHANNELS, TIME_EMB, TIME_EMB, key=next(keys))
-
-        # ---- encoder ----
+        
+        #---- encoder -----
         self.down_blocks = []
         self.downsamples = []
         for i in range(len(widths)):
             in_ch = widths[i - 1] if i > 0 else widths[0]
             self.down_blocks.append(ResBlock(in_ch, widths[i], TIME_EMB, next(keys)))
             self.downsamples.append(Downsample(widths[i], next(keys)))
-
-        # ---- bottleneck ----
+        
+        #----- bottleneck -------
         self.mid1 = ResBlock(widths[-1], BOTTLENECK, TIME_EMB, next(keys))
         self.mid2 = ResBlock(BOTTLENECK, BOTTLENECK, TIME_EMB, next(keys))
 
-        # ---- decoder (mirror) ----
+        #------ decoder -------
         self.up_blocks = []
         self.upsamples = []
         prev = BOTTLENECK
         for i in reversed(range(len(widths))):
             self.upsamples.append(Upsample(prev, next(keys)))
-            # after upsample we concat the encoder skip of width widths[i]
+            # skip connections with width[i] layer of encoder
             self.up_blocks.append(ResBlock(prev + widths[i], widths[i], TIME_EMB, next(keys)))
             prev = widths[i]
 
+        #------ output refinement ---------
         self.out_norm = eqx.nn.GroupNorm(GROUPS, widths[0])
-        self.out_conv = eqx.nn.Conv2d(widths[0], INPUT_CHANNELS, 1, key=next(keys))
+        self.out_conv = eqx.nn.Conv2d(widths[0], INPUT_CHANNELS, kernel_size=1, key=next(keys))
 
     def __call__(self, x, t):
+        #----------- time ----------------
         t_emb = self.t_mlp(fourier_embedding(t))
 
+        #----------- input layer ---------
         h = self.in_conv(x)
 
+        # ---------- down -----------------
         skips = []
         for block, down in zip(self.down_blocks, self.downsamples):
-            h = block(h, t_emb)
+            h = run_block(block, h, t_emb)
             skips.append(h)
             h = down(h)
 
-        h = self.mid1(h, t_emb)
-        h = self.mid2(h, t_emb)
+        # ---------- bottleneck ------------
+        h = run_block(self.mid1, h, t_emb)
+        h = run_block(self.mid2, h, t_emb)
 
-        for up, block, skip in zip(self.upsamples, self.up_blocks, reversed(skips)):
+        # ---------- up --------------------
+        for up, block, skip in zip(self.upsamples, self.up_blocks, reversed(skip)):
             h = up(h)
             h = jnp.concatenate([h, skip], axis=0)
-            h = block(h, t_emb)
+            h = run_block(block, h, t_emb)
 
+        # ----------- output ----------------
         h = jax.nn.silu(self.out_norm(h))
         return self.out_conv(h)
 
@@ -201,10 +274,8 @@ class UNet(eqx.Module):
 def create_model(key):
     return UNet(key)
 
-
 def save_model(model: UNet, filepath: str):
     eqx.tree_serialise_leaves(filepath, model)
-
 
 def load_model(filepath: str, key):
     model = UNet(key)

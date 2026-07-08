@@ -22,8 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import matplotlib.pyplot as plt
-
-from unet_models import unet_flow_film
+import unet_flow_film
 
 
 # ==========================================================================
