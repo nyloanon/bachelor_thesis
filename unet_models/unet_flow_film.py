@@ -36,7 +36,7 @@ import equinox as eqx
 #  constants
 # ==========================================================================
 
-INPUT_CHANNELS = 1  #(density, velocity_x, velocity_y, pressure)
+INPUT_CHANNELS = 4  #(density, velocity_x, velocity_y, pressure)
 WIDTHS = (64, 128, 256, 384)
 BOTTLENECK = 512
 FOURIER_DIM = 32
@@ -136,7 +136,7 @@ class ResBlock(eqx.Module):
         h = self.conv1(jax.nn.silu(self.norm1(x)))
 
         # FiLM 
-        scale, shift = jnp.split(self.film(t_emb), 2, axis=1)
+        scale, shift = jnp.split(self.film(t_emb), 2, axis=-1)
         h = self.norm2(h)
         h = h * (1.0 + scale[:, None, None]) + shift[:, None, None]
         h = self.conv2(jax.nn.silu(h))
@@ -257,7 +257,7 @@ class UNet(eqx.Module):
         h = run_block(self.mid2, h, t_emb)
 
         # ---------- up --------------------
-        for up, block, skip in zip(self.upsamples, self.up_blocks, reversed(skip)):
+        for up, block, skip in zip(self.upsamples, self.up_blocks, reversed(skips)):
             h = up(h)
             h = jnp.concatenate([h, skip], axis=0)
             h = run_block(block, h, t_emb)

@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import matplotlib.pyplot as plt
-import unet_flow_film
+from unet_models import unet_flow_film
 
 
 # ==========================================================================
@@ -83,7 +83,7 @@ def load_data(data_dir, max_samples=None):
     std = data.std(axis=(0, 2, 3), keepdims=True)
     data = (data - mean) / std
 
-    return jnp.asarray(data), mean.squeeze(), std.squeeze()  # stats shape (4,)
+    return data, mean.squeeze(), std.squeeze()  # stats shape (4,)
 
 
 # ==========================================================================

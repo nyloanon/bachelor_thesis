@@ -4,6 +4,7 @@ autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
+import os as _os
 # numerics
 import jax
 import jax.numpy as jnp
@@ -38,6 +39,7 @@ from astronomix.option_classes.simulation_config import (
     MINMOD,
     OSHER,
     PERIODIC_BOUNDARY,
+    OPEN_BOUNDARY,
     BoundarySettings,
     BoundarySettings1D,
     FINITE_VOLUME,
@@ -65,6 +67,21 @@ scale_time = False
 dt_max = 0.1
 num_timesteps = 2000
 
+# mach number setup
+n_mach = 0.5
+rho_back = 1.0
+rho_slab = 2.0
+p_0 = 2.5
+
+# critical mach number
+delta = rho_slab / rho_back 
+n_mach_crit = (1.0 + delta ** (-1 / 3)) ** (2 / 3)
+print(f"Critical mach number for current setup rho_back = {rho_back}, rho_slab = {rho_slab}, n_mach_crit = {n_mach_crit}. \n")
+# calc of back ground propagation speed 
+c_s_back = jnp.sqrt(gamma * p_0 / rho_back)
+v_total = c_s_back * n_mach
+v_a = v_total / 2
+
 # setup simulation config
 config = SimulationConfig(
     progress_bar = False,
@@ -76,7 +93,7 @@ config = SimulationConfig(
     num_timesteps = num_timesteps,
     boundary_settings = BoundarySettings(
         x = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-        y = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
+        y = BoundarySettings1D(OPEN_BOUNDARY, OPEN_BOUNDARY)
     ),
     limiter = DOUBLE_MINMOD,
     return_snapshots = False,
@@ -195,6 +212,27 @@ def random_khi_fourier_modes(
 In this step we generate the 256x256 KHI data which we train our model with. We went for _ images for a start.
 """
 
+def slab_profile(f_b, f_s, Y, y_center, slab_radius, smoothing_length):
+    """Tanh transition from f_b (background) to f_s (stream)."""
+
+    # f(y) = f_b + 0.25 * (f_s - f_b) * (1 + tanh((R_s - (y - y_c)) / σ)) * (1 + tanh((R_s + (y - y_c)) / σ))
+    return f_b + 0.25 * (f_s - f_b) * (
+        (1 + jnp.tanh((slab_radius - (Y - y_center)) / smoothing_length)) *
+        (1 + jnp.tanh((slab_radius + (Y - y_center)) / smoothing_length))
+    )
+
+def calc_smoothing_cells(n_mach, min_smoothing_cells = 2, max_smoothing_cells = 12, min_n_mach = 0.5, max_n_mach = 1.7):
+    """Calculation of smoothing cells, required to prevent numerical fragments.
+    A linear relation between the mach number n_mach and the smoothing_cells required was assumed, motivated by the fact that the mach number increases linearly with fluid velocity.
+    """
+
+    k = (max_n_mach - n_mach) / (max_n_mach - min_n_mach)
+    smoothing_cells = min_smoothing_cells + (1 - k) * (max_smoothing_cells - min_smoothing_cells)
+
+    return smoothing_cells
+
+
+
 # Grid size and configuration
 num_cells = config.num_cells
 x = jnp.linspace(0, 1, num_cells.x)
@@ -202,15 +240,29 @@ y = jnp.linspace(0, 1, num_cells.y)
 X, Y = jnp.meshgrid(x, y, indexing="ij")
 
 # Initialize state
-rho = jnp.ones_like(X)
-u_x = 0.5 * jnp.ones_like(X)
+rho = rho_back * jnp.ones_like(X)
+u_x = v_a * jnp.ones_like(X)
+
+# Slab mask
+mask = (Y > 0.25) & (Y < 0.75)
+
+# between y = 0.25 and y = 0.75 set u_x to -0.5 and rho to 2.0
+y_center = 0.5
+slab_radius = 0.25
+smoothing_cells = calc_smoothing_cells(n_mach)
+print(smoothing_cells)
+smoothing_length = smoothing_cells / num_cells.x 
+
+u_x = slab_profile(v_a, -v_a, Y, y_center, slab_radius, smoothing_length)
+rho = slab_profile(rho_back, rho_slab, Y, y_center, slab_radius, smoothing_length)
+p = jnp.ones((num_cells.x, num_cells.x)) * p_0
 
 # deterministic setup
 # u_y = 0.01 * jnp.sin(2 * jnp.pi * X)
 
 # random initialization
 key = PRNGKey(0)
-num_sims = 100000
+num_sims = 1
 
 # training data (num_sims x matrix of dim num_cells x num_cells)
 data = jnp.zeros((num_sims, num_cells.x, num_cells.x))
@@ -218,17 +270,6 @@ data = jnp.zeros((num_sims, num_cells.x, num_cells.x))
 for i in range(num_sims):
   print("finished iteration", i)
   key, subkey = jax.random.split(key)
-
-  # Base state
-  rho = jnp.ones_like(X)
-  u_x = 0.5 * jnp.ones_like(X)
-
-  # Slab mask
-  mask = (Y > 0.25) & (Y < 0.75)
-
-  # between y = 0.25 and y = 0.75 set u_x to -0.5 and rho to 2.0
-  u_x = jnp.where(mask, -0.5, u_x)
-  rho = jnp.where(mask, 2.0, rho)
 
   # KHI-suited random Fourier perturbation
   u_y = random_khi_fourier_modes(
@@ -242,9 +283,6 @@ for i in range(num_sims):
       width=0.03,
       spectral_slope=1.0,
   )
-
-  # Initialize pressure
-  p = jnp.ones((num_cells.x, num_cells.x)) * 2.5
 
   # Initial state
   initial_state = construct_primitive_state(
@@ -265,6 +303,6 @@ for i in range(num_sims):
       registered_variables,
   )
 
-  jnp.save(f"100k_data/final_state_{i}", final_state)
+  jnp.save(f"test/final_state_{i}", final_state)
   plt.imshow(final_state[0, :, :])
-  plt.savefig(f"100k_figures/final_state{i}.png")
+  plt.savefig(f"test/final_state{i}.png")
