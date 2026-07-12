@@ -1,5 +1,8 @@
-/data
-/figures
+/khi_data
+/data_no_mach
+/figures_no_mach
+/5.5k_data_no_mach
+/5.5k_figures_no_mach
 /evaluation_plots
 /checkpoints
 /cnn_checkpoints
