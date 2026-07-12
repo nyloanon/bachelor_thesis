@@ -128,31 +128,49 @@ def compute_stats(files):
     tp_max = -np.inf
 
     machs = []
+    valid_files = []
 
     for i, filename in enumerate(files):
-        
+
         if i % 100 == 0:
             print(i, "/", len(files))
 
-        with np.load(filename) as sample:
+        try:
+            with np.load(filename) as sample:
 
-            states = sample["states"]          # (100,4,256,256)
+                states = sample["states"]          # (100,4,256,256)
 
-            channel_sum += states.sum(axis=(0,2,3))
-            channel_sqsum += (states**2).sum(axis=(0,2,3))
+                channel_sum += states.sum(axis=(0,2,3))
+                channel_sqsum += (states**2).sum(axis=(0,2,3))
 
-            n_pixels += (
-                states.shape[0]
-                * states.shape[2]
-                * states.shape[3]
-            )
+                n_pixels += (
+                    states.shape[0]
+                    * states.shape[2]
+                    * states.shape[3]
+                )
 
-            tp = sample["time_points"]
+                tp = sample["time_points"]
 
-            tp_min = min(tp_min, tp.min())
-            tp_max = max(tp_max, tp.max())
+                tp_min = min(tp_min, tp.min())
+                tp_max = max(tp_max, tp.max())
 
-            machs.append(sample["mach"].item())
+                machs.append(sample["mach"].item())
+
+                valid_files.append(filename)
+
+        except Exception as e:
+
+            print("\nSkipping corrupted file:")
+            print(filename)
+            print("Reason:", e)
+            print()
+
+    print(
+        f"Successfully processed {len(valid_files)} / {len(files)} files"
+    )
+
+    if len(valid_files) == 0:
+        raise RuntimeError("No valid .npz files found!")
 
     channel_mean = channel_sum / n_pixels
 
@@ -162,7 +180,7 @@ def compute_stats(files):
 
     machs = np.asarray(machs)
 
-    return {
+    stats = {
 
         "channel_mean": jnp.asarray(channel_mean),
 
@@ -174,9 +192,11 @@ def compute_stats(files):
 
         "mach_mean": jnp.asarray(machs.mean()),
 
-        "mach_std": jnp.asarray(machs.std())
+        "mach_std": jnp.asarray(machs.std()),
 
     }
+
+    return stats, valid_files
 
 def normalize_states(states, channel_mean, channel_std):
     """
@@ -272,7 +292,7 @@ def load_files(data_dir, max_samples=None):
     if max_samples is not None:
         files = files[:max_samples]
     if not files:
-        raise FileNotFoundError(f"No data found in {data_dir}/final_state_*.npy")
+        raise FileNotFoundError(f"No data found in {data_dir}/final_state_*.npz")
 
     return files
 
@@ -327,7 +347,7 @@ def main():
 
     else:
         print("computing statistics")
-        stats = compute_stats(files)
+        stats, valid_files = compute_stats(files)
 
         print(
             "stats time:",
@@ -346,15 +366,15 @@ def main():
         )
 
     # ------- validation cache -------------
-    perm = np.random.RandomState(args.seed).permutation(len(files))
+    perm = np.random.RandomState(args.seed).permutation(len(valid_files))
 
-    files = [files[i] for i in perm]
+    valid_files = [valid_files[i] for i in perm]
 
     n_val = max(1, int(len(files) * args.val_frac))
 
-    val_files = files[:n_val]
+    val_files = valid_files[:n_val]
 
-    train_files = files[n_val:]
+    train_files = valid_files[n_val:]
 
     val_cache = load_cache(
     val_files,
