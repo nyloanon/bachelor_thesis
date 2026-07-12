@@ -9,6 +9,7 @@
 /cnn_data
 /unet_checkpoints
 /unet_generations
+/conditioned_unet_checkpoints
 /unet_data
 /test.py
 /cnn_test.py
