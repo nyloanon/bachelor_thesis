@@ -198,6 +198,22 @@ def compute_stats(files):
 
     return stats, valid_files
 
+def load_stats(directory):
+    stat_file = os.path.join(directory, "norm_stats.npz")
+    print("loading existing statistics")
+    data = np.load(stat_file)
+
+    stats = {
+        "channel_mean": data["channel_mean"],
+        "channel_std": data["channel_std"],
+        "tp_min": data["tp_min"],
+        "tp_max": data["tp_max"],
+        "mach_mean": data["mach_mean"],
+        "mach_std": data["mach_std"],
+    }
+
+    return stats
+
 def normalize_states(states, channel_mean, channel_std):
     """
     states: (cache_size, 100, 4, 256, 256)
@@ -306,15 +322,14 @@ def main():
     parser.add_argument("--data-dir", type=str, default="khi_data")
     parser.add_argument("--ckpt-dir", type=str, default="conditioned_unet_checkpoints")
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--cache-size", type=int, default=32)
-    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--cache_size", type=int, default=512,)
-    parser.add_argument("--steps_per_cache", type=int, default=128,)
+    parser.add_argument("--cache_size", type=int, default=32)
+    parser.add_argument("--steps_per_cache", type=int, default=128)
     args = parser.parse_args()
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -328,64 +343,27 @@ def main():
 
     print(f"Found {len(files)} simulations.")
 
-    start = time.time()
-
-    stat_file = os.path.join(args.ckpt_dir, "norm_stats.npz")
-
-    if os.path.exists(stat_file):
-        print("loading existing statistics")
-        data = np.load(stat_file)
-
-        stats = {
-            "channel_mean": data["channel_mean"],
-            "channel_std": data["channel_std"],
-            "tp_min": data["tp_min"],
-            "tp_max": data["tp_max"],
-            "mach_mean": data["mach_mean"],
-            "mach_std": data["mach_std"],
-        }
-
-    else:
-        print("computing statistics")
-        stats, valid_files = compute_stats(files)
-
-        print(
-            "stats time:",
-            time.time()-start,
-            "seconds"
-        )
-
-        np.savez(
-        os.path.join(args.ckpt_dir, "norm_stats.npz"),
-        channel_mean=np.array(stats["channel_mean"]),
-        channel_std=np.array(stats["channel_std"]),
-        tp_min=float(stats["tp_min"]),
-        tp_max=float(stats["tp_max"]),
-        mach_mean=float(stats["mach_mean"]),
-        mach_std=float(stats["mach_std"])
-        )
+    stats = load_stats(args.ckpt_dir)
 
     # ------- validation cache -------------
-    perm = np.random.RandomState(args.seed).permutation(len(valid_files))
-
-    valid_files = [valid_files[i] for i in perm]
+    perm = np.random.RandomState(args.seed).permutation(len(files))
+    files = [files[i] for i in perm]
 
     n_val = max(1, int(len(files) * args.val_frac))
 
-    val_files = valid_files[:n_val]
-
-    train_files = valid_files[n_val:]
+    val_files = files[:n_val]
+    train_files = files[n_val:]
 
     val_cache = load_cache(
     val_files,
     stats,
     0,
-    len(val_files),
+    min(args.cache_size, len(val_files)),
     )
 
     val_key = jax.random.key(12345)
 
-    x_rf_val, current_val, t_rf_val, dt_val, mach_val, v_val = cached_batch(
+    x_t_rf_val, current_val, t_rf_val, dt_val, mach_val, v_val = cached_batch(
         val_key,
         val_cache,
         batch_size=64,
@@ -394,7 +372,7 @@ def main():
     # ---- model / optimiser ----
     key = jax.random.key(args.seed)
     key, mkey = jax.random.split(key)
-    model = unet_flow_film.create_model(mkey)
+    model = unet_flow_film_cached.create_model(mkey)
     ema_model = model
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array)))
     print(f"model params: {n_params / 1e6:.2f} M")
@@ -408,139 +386,134 @@ def main():
     perm = np.random.permutation(len(train_files))
     shuffled_files = [train_files[i] for i in perm]
 
-    cache = load_cache(shuffled_files, stats, 0, args.cache_size)
-    batch = cached_batch(
-    jax.random.key(0),
-    cache,
-    batch_size=2,
+
+    # ---- training loop -----
+    global_step = 0
+    loss_history = []
+    val_history = []
+    val_steps = []
+
+    key_train = jax.random.key(args.seed + 1)
+
+    checkpoint_steps = {
+        args.steps // 4,
+        args.steps // 2,
+        3 * args.steps // 4,
+        args.steps,
+    }
+
+    while global_step < args.steps:
+
+        perm = np.random.permutation(len(train_files))
+        shuffled_files = [train_files[i] for i in perm]
+
+        cache_start = 0
+
+        while (
+            cache_start < len(shuffled_files)
+            and global_step < args.steps
+        ):
+
+            cache = load_cache(
+                shuffled_files,
+                stats,
+                cache_start,
+                args.cache_size,
+            )
+
+            for _ in range(args.steps_per_cache):
+
+                if global_step >= args.steps:
+                    break
+
+                key_train, batch_key = jax.random.split(key_train)
+
+                batch = cached_batch(
+                    batch_key,
+                    cache,
+                    args.batch_size
+                )
+
+                (
+                    x_t_rf,
+                    current,
+                    t_rf,
+                    dt,
+                    mach,
+                    v_target
+                ) = batch
+
+                model, ema_model, opt_state, loss = train_step(
+                    model,
+                    ema_model,
+                    opt_state,
+                    x_t_rf,
+                    current,
+                    t_rf,
+                    dt,
+                    mach,
+                    v_target,
+                    optimizer,
+                    args.ema_decay
+                )
+
+                global_step += 1
+
+                loss_history.append(float(loss))
+
+                if global_step % 10 == 0:
+
+                    val_mse = float(
+                        loss_function(
+                            ema_model,
+                            x_t_rf_val,
+                            current_val,
+                            t_rf_val,
+                            dt_val,
+                            mach_val,
+                            v_val
+                        )
+                    )
+
+                    val_history.append(val_mse)
+                    val_steps.append(global_step)
+
+                    print(
+                        f"step {global_step:6d} | "
+                        f"train {float(loss):.5f} | "
+                        f"val {val_mse:.5f}",
+                        flush=True
+                    )
+
+                if global_step in checkpoint_steps:
+
+                    unet_flow_film_cached.save_model(
+                        model,
+                        os.path.join(
+                            args.ckpt_dir,
+                            f"conditioned_unet_{global_step}.eqx"
+                        ),
+                    )
+
+                    unet_flow_film_cached.save_model(
+                        ema_model,
+                        os.path.join(
+                            args.ckpt_dir,
+                            f"conditioned_unet_ema_{global_step}.eqx"
+                        ),
+                    )
+
+            cache_start += args.cache_size
+    
+    unet_flow_film_cached.save_model(
+    model,
+    os.path.join(args.ckpt_dir, "conditioned_unet_final.eqx")
     )
-    print("before")
-    out = jax.vmap(model)(
-        batch[0],  # x_t_rf
-        batch[1],  # current
-        batch[2],  # t_rf
-        batch[3],  # dt
-        batch[4],  # mach
+
+    unet_flow_film_cached.save_model(
+        ema_model,
+        os.path.join(args.ckpt_dir, "conditioned_unet_ema_final.eqx")
     )
-    print("after")
-
-    print(out.shape)
-
-    # # ---- training loop -----
-    # global_step = 0
-
-    # key_train = jax.random.key(args.seed + 1)
-
-    # checkpoint_steps = {
-    #     args.steps // 4,
-    #     args.steps // 2,
-    #     3 * args.steps // 4,
-    #     args.steps,
-    # }
-
-    # while global_step < args.steps:
-
-    #     perm = np.random.permutation(len(train_files))
-    #     shuffled_files = [train_files[i] for i in perm]
-
-    #     cache_start = 0
-
-    #     while (
-    #         cache_start < len(shuffled_files)
-    #         and global_step < args.steps
-    #     ):
-
-    #         cache = load_cache(
-    #             shuffled_files,
-    #             stats,
-    #             cache_start,
-    #             args.cache_size,
-    #         )
-
-    #         for _ in range(args.steps_per_cache):
-
-    #             if global_step >= args.steps:
-    #                 break
-
-    #             key_train, batch_key = jax.random.split(key_train)
-
-    #             batch = cached_batch(
-    #                 batch_key,
-    #                 cache,
-    #                 args.batch_size
-    #             )
-
-    #             (
-    #                 x_t_rf,
-    #                 current,
-    #                 t_rf,
-    #                 dt,
-    #                 mach,
-    #                 v_target
-    #             ) = batch
-
-    #             model, ema_model, opt_state, loss = train_step(
-    #                 model,
-    #                 ema_model,
-    #                 opt_state,
-    #                 x_t_rf,
-    #                 current,
-    #                 t_rf,
-    #                 dt,
-    #                 mach,
-    #                 v_target,
-    #                 optimizer,
-    #                 args.ema_decay
-    #             )
-
-    #             global_step += 1
-
-    #             loss_history.append(float(loss))
-
-    #             if global_step % 500 == 0:
-
-    #                 val_mse = float(
-    #                     loss_function(
-    #                         ema_model,
-    #                         x_rf_val,
-    #                         current_val,
-    #                         t_rf_val,
-    #                         dt_val,
-    #                         mach_val,
-    #                         v_val
-    #                     )
-    #                 )
-
-    #                 val_history.append(val_mse)
-    #                 val_steps.append(global_step)
-
-    #                 print(
-    #                     f"step {global_step:6d} | "
-    #                     f"train {float(loss):.5f} | "
-    #                     f"val {val_mse:.5f}",
-    #                     flush=True
-    #                 )
-
-    #             if global_step in checkpoint_steps:
-
-    #                 unet_flow_film.save_model(
-    #                     model,
-    #                     os.path.join(
-    #                         args.ckpt_dir,
-    #                         f"unet_{global_step}.eqx"
-    #                     ),
-    #                 )
-
-    #                 unet_flow_film.save_model(
-    #                     ema_model,
-    #                     os.path.join(
-    #                         args.ckpt_dir,
-    #                         f"unet_ema_{global_step}.eqx"
-    #                     ),
-    #                 )
-
-    #         cache_start += args.cache_size
-
 
 if __name__ == "__main__":
     main()

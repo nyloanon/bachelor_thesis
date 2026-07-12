@@ -37,7 +37,8 @@ import equinox as eqx
 # ==========================================================================
 
 INPUT_CHANNELS = 8  #(x_rf and current concatenated --> (B, 8, 256, 256))
-BASE_CHANNELS = 64
+OUTPUT_CHANNELS = 4
+BASE_CHANNELS = 32
 WIDTHS = (BASE_CHANNELS, BASE_CHANNELS*2, BASE_CHANNELS*4, BASE_CHANNELS*6)
 BOTTLENECK = BASE_CHANNELS*8
 FOURIER_DIM = 32
@@ -186,7 +187,7 @@ _run_block_ckpt = eqx.filter_checkpoint(_run_block)
 
 def run_block(block, x, cond):
     if USE_CHECKPOINT:
-        return _run_block_ckpt(block, x_rf, cond)
+        return _run_block_ckpt(block, x, cond)
     return _run_block(block, x, cond)
 
 
@@ -243,16 +244,16 @@ class UNet(eqx.Module):
 
         #------ output refinement ---------
         self.out_norm = eqx.nn.GroupNorm(GROUPS, widths[0])
-        self.out_conv = eqx.nn.Conv2d(widths[0], INPUT_CHANNELS, kernel_size=1, key=next(keys))
+        self.out_conv = eqx.nn.Conv2d(widths[0], OUTPUT_CHANNELS, kernel_size=1, key=next(keys))
 
     def __call__(self, x_t_rf, current, t_rf, dt, mach):
         #----------- time ----------------
-        x = jnp.collected(
+        x = jnp.concatenate(
             [
                 x_t_rf,
                 current
             ],
-            axis=1
+            axis=0
         )
         
         t_rf_emb = self.t_rf_mlp(fourier_embedding(t_rf))
