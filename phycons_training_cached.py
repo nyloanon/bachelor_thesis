@@ -11,7 +11,10 @@ autocvd(num_gpus=1)
 #  final state, and x_t = (1 - t) x0 + t x1.  Sampling then integrates this
 #  velocity field from noise (t=0) to data (t=1).
 # ==========================================================================
-import time
+
+# prevent OOM
+import os
+os.environ["JAX_ENABLE_X64"] = "False"
 
 import argparse
 import glob
@@ -88,7 +91,7 @@ def cached_batch(key, cache, batch_size):
             t_rf,
             dt,
             mach,
-            v_target
+            v_target.astype(jnp.float32)
         )
 
     return jax.vmap(single_sample)(keys)
@@ -322,8 +325,8 @@ def main():
     parser.add_argument("--data-dir", type=str, default="khi_data")
     parser.add_argument("--ckpt-dir", type=str, default="conditioned_unet_checkpoints")
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--steps", type=int, default=150000)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--val-frac", type=float, default=0.1)
@@ -461,7 +464,7 @@ def main():
 
                 loss_history.append(float(loss))
 
-                if global_step % 10 == 0:
+                if global_step % 1000 == 0:
 
                     val_mse = float(
                         loss_function(
@@ -514,6 +517,23 @@ def main():
         ema_model,
         os.path.join(args.ckpt_dir, "conditioned_unet_ema_final.eqx")
     )
+
+    # ---- plots ----
+    plt.figure()
+    plt.plot(loss_history, alpha=0.4, label="train (per step)")
+    # smoothed
+    if len(loss_history) > 100:
+        w = 100
+        smooth = np.convolve(loss_history, np.ones(w) / w, mode="valid")
+        plt.plot(np.arange(w - 1, len(loss_history)), smooth, label="train (smoothed)")
+    plt.plot(val_steps, val_history, "o-", label="val (ema)")
+    plt.yscale("log")
+    plt.xlabel("step")
+    plt.ylabel("MSE loss")
+    plt.legend()
+    plt.title("Rectified-flow training")
+    plt.savefig("loss_history.png", dpi=120)
+    print("wrote loss_history.png")
 
 if __name__ == "__main__":
     main()

@@ -12,13 +12,13 @@ autocvd(num_gpus=1)
 # ==========================================================================
 #  Rectified-flow U-Net for KHI field generation
 #
-#  Predicts the rectified-flow velocity v(x_t, t) for the full 4-channel
-#  field (density, velocity_x, velocity_y, pressure).
+#  Predicts the rectified-flow velocity v(x_t_rf, current, t_rf, dt, mach) for the full 4-channel
+#  field (density, velocity_x, velocity_y, pressure) following current field after time difference dt.
 #
 #  Design notes
 #  ------------
 #  * DDPM-style residual blocks (GroupNorm + SiLU + 3x3 conv) with FiLM
-#    time conditioning (per-channel scale & shift). FiLM is applied at full
+#    flow time, physical time difference dt and mach number conditioning (per-channel scale & shift). FiLM is applied at full
 #    strength -- time information is essential for a flow model.
 #  * Channel widths grow with depth; the architecture is parameterised by a
 #    list of widths so there is no fragile hand-tuned channel arithmetic.
@@ -36,10 +36,10 @@ import equinox as eqx
 #  constants
 # ==========================================================================
 
-INPUT_CHANNELS = 8  #(x_rf and current concatenated --> (B, 8, 256, 256))
+INPUT_CHANNELS = 8
 OUTPUT_CHANNELS = 4
-BASE_CHANNELS = 32
-WIDTHS = (BASE_CHANNELS, BASE_CHANNELS*2, BASE_CHANNELS*4, BASE_CHANNELS*6)
+BASE_CHANNELS = 64
+WIDTHS = (BASE_CHANNELS, BASE_CHANNELS*2, BASE_CHANNELS*4, BASE_CHANNELS*8)
 BOTTLENECK = BASE_CHANNELS*8
 FOURIER_DIM = 32
 EMB_CHANNELS = FOURIER_DIM * 2
@@ -225,37 +225,37 @@ class UNet(eqx.Module):
         self.downsamples = []
         for i in range(len(widths)):
             in_ch = widths[i - 1] if i > 0 else widths[0]
-            self.down_blocks.append(ResBlock(in_ch, widths[i], COND_DIM, next(keys)))
-            self.downsamples.append(Downsample(widths[i], next(keys)))
+            self.down_blocks.append(ResBlock(in_ch, widths[i], COND_DIM, key=next(keys)))
+            self.downsamples.append(Downsample(widths[i], key=next(keys)))
         
         #----- bottleneck -------
-        self.mid1 = ResBlock(widths[-1], BOTTLENECK, COND_DIM, next(keys))
-        self.mid2 = ResBlock(BOTTLENECK, BOTTLENECK, COND_DIM, next(keys))
+        self.mid1 = ResBlock(widths[-1], BOTTLENECK, COND_DIM, key=next(keys))
+        self.mid2 = ResBlock(BOTTLENECK, BOTTLENECK, COND_DIM, key=next(keys))
 
         #------ decoder -------
         self.up_blocks = []
         self.upsamples = []
         prev = BOTTLENECK
         for i in reversed(range(len(widths))):
-            self.upsamples.append(Upsample(prev, next(keys)))
+            self.upsamples.append(Upsample(prev, key=next(keys)))
             # skip connections with width[i] layer of encoder
-            self.up_blocks.append(ResBlock(prev + widths[i], widths[i], COND_DIM, next(keys)))
+            self.up_blocks.append(ResBlock(prev + widths[i], widths[i], COND_DIM, key=next(keys)))
             prev = widths[i]
 
         #------ output refinement ---------
         self.out_norm = eqx.nn.GroupNorm(GROUPS, widths[0])
         self.out_conv = eqx.nn.Conv2d(widths[0], OUTPUT_CHANNELS, kernel_size=1, key=next(keys))
 
-    def __call__(self, x_t_rf, current, t_rf, dt, mach):
-        #----------- time ----------------
+    def __call__(self, x_t_rf, current, t_rf, t_ph, mach):
+        #----------- flow time, physical time difference dt and mach number conditioning ----------------
         x = jnp.concatenate(
             [
                 x_t_rf,
-                current
+                current 
             ],
             axis=0
         )
-        
+
         t_rf_emb = self.t_rf_mlp(fourier_embedding(t_rf))
         dt_emb = self.dt_mlp(fourier_embedding(dt))
         mach_emb = self.mach_mlp(fourier_embedding(mach))
