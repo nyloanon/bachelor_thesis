@@ -3,17 +3,10 @@
 /figures_no_mach
 /5.5k_data_no_mach
 /5.5k_figures_no_mach
-/evaluation_plots
-/checkpoints
-/cnn_checkpoints
-/cnn_data
 /unet_checkpoints
 /unet_generations
-/conditioned_unet_checkpoints
+/physcons_conditioned_unet_checkpoints
+/snap_conditioned_unet_checkpoints
 /unet_data
-/test.py
-/cnn_test.py
-/100k_data
-/100k_figures
-/analysis
 /four_channels
+/models/cnn models

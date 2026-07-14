@@ -68,9 +68,18 @@ USE_CHECKPOINT = _os.environ.get("KHI_CHECKPOINT", "1") != "0"
 """
 
 def fourier_embedding(t: float):
-    # calculate frequencies and angles
-    d : int = 2
-    freqs = jnp.array([MAX_PERIOD ** (-k / d) for k in range(FOURIER_DIM)])
+
+    """
+    Fourier-feature embedding of a scalar conditioner.
+    Angular frequencies are log-spaced from 1 to MAX_PERIOD cycles over a unit
+    input interval, so a conditioner in ~[0, 1] (flow time, time fraction) or a
+    standardised one (Mach) gets a rich multi-scale code with *all* FOURIER_DIM
+    channels active. (The previous 1000^(-k/2) ladder collapsed to ~1e-46 by
+    k=4, leaving almost every channel constant and the conditioning weak.) 
+    """
+    freqs = 2.0 * jnp.pi * jnp.exp(
+        jnp.linspace(0.0, jnp.log(MAX_PERIOD), FOURIER_DIM)
+    )
     angles = freqs * t
 
     return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)])
@@ -246,11 +255,11 @@ class UNet(eqx.Module):
         self.out_norm = eqx.nn.GroupNorm(GROUPS, widths[0])
         self.out_conv = eqx.nn.Conv2d(widths[0], OUTPUT_CHANNELS, kernel_size=1, key=next(keys))
 
-    def __call__(self, x_t_rf, t_rf, t_ph, mach):
+    def __call__(self, x_t_rf, t_rf, t_frac, mach):
         #----------- flow time, physical time and mach conditioning ----------------
         
         t_rf_emb = self.t_rf_mlp(fourier_embedding(t_rf))
-        t_ph_emb = self.t_ph_mlp(fourier_embedding(dt))
+        t_ph_emb = self.t_ph_mlp(fourier_embedding(t_frac))
         mach_emb = self.mach_mlp(fourier_embedding(mach))
         
         cond = jnp.concatenate(

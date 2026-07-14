@@ -26,26 +26,28 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import matplotlib.pyplot as plt
-from unet_models import unet_flow_film_cached
+from models/unet_models import unet_flow_film_cached
 
 
 # ==========================================================================
 #  rectified-flow batch sampling
 # ==========================================================================
 
-def sample_snap(cache, sim_idx, t_idx):
+def sample_transition(cache, sim_idx, t_idx):
     """
-    Extract one snapshot from simulation and return physical properties.
+    Extract one transition from a cached simulation.
     """
 
     states = cache["states"][sim_idx]
     times = cache["time_points"][sim_idx]
     mach = cache["mach"][sim_idx]
 
-    snap = states[t_idx]
-    t_ph = times[t_idx]
+    current = states[t_idx]
+    target = states[t_idx + 1]
 
-    return snap, t_ph, mach
+    dt = times[t_idx + 1] - times[t_idx]
+
+    return current, target, dt, mach
 
 def cached_batch(key, cache, batch_size):
 
@@ -69,7 +71,7 @@ def cached_batch(key, cache, batch_size):
             cache["states"].shape[1] - 1
         )
 
-        snap, t_ph, mach = sample_transition(
+        current, target, dt, mach = sample_transition(
             cache,
             sim_idx,
             t_idx
@@ -79,29 +81,30 @@ def cached_batch(key, cache, batch_size):
 
         t_rf = jax.random.uniform(key_rf, ())
 
-        x_t = (1.0 - t_rf) * x0 + t_rf * snap
+        x_t_rf = (1.0 - t_rf) * x0 + t_rf * target
 
-        v_target = snap - x0
+        v_target = target - x0
 
         return (
-            x_t,
+            x_t_rf,
+            current,
             t_rf,
-            t_ph,
+            dt,
             mach,
-            v_target
+            v_target.astype(jnp.float32)
         )
 
     return jax.vmap(single_sample)(keys)
 
 
-def loss_function(model, x_t, current, t_rf, dt, mach, v_target):
-    v_pred = jax.vmap(model)(x_t, t_rf, t_ph, mach)
+def loss_function(model, x_t_rf, current, t_rf, dt, mach, v_target):
+    v_pred = jax.vmap(model)(x_t_rf, current, t_rf, dt, mach)
     return jnp.mean((v_pred - v_target) ** 2)
 
 
 @eqx.filter_jit
-def train_step(model, ema_model, opt_state, x_t, current, t_rf, dt, mach, v_target, optimizer, ema_decay):
-    loss, grads = eqx.filter_value_and_grad(loss_function)(model, x_t, t_rf, t_ph, mach, v_target)
+def train_step(model, ema_model, opt_state, x_t_rf, current, t_rf, dt, mach, v_target, optimizer, ema_decay):
+    loss, grads = eqx.filter_value_and_grad(loss_function)(model, x_t_rf, current, t_rf, dt, mach, v_target)
     updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
     model = eqx.apply_updates(model, updates)
 
@@ -363,7 +366,7 @@ def main():
 
     val_key = jax.random.key(12345)
 
-    x_t_val, t_rf_val, t_ph_val, mach_val, v_val = cached_batch(
+    x_t_rf_val, current_val, t_rf_val, dt_val, mach_val, v_val = cached_batch(
         val_key,
         val_cache,
         batch_size=64,
@@ -435,9 +438,10 @@ def main():
                 )
 
                 (
-                    x_t,
+                    x_t_rf,
+                    current,
                     t_rf,
-                    t_ph,
+                    dt,
                     mach,
                     v_target
                 ) = batch
@@ -446,9 +450,10 @@ def main():
                     model,
                     ema_model,
                     opt_state,
-                    x_t,
+                    x_t_rf,
+                    current,
                     t_rf,
-                    t_ph,
+                    dt,
                     mach,
                     v_target,
                     optimizer,
@@ -464,9 +469,10 @@ def main():
                     val_mse = float(
                         loss_function(
                             ema_model,
-                            x_t_val,
+                            x_t_rf_val,
+                            current_val,
                             t_rf_val,
-                            t_ph_val,
+                            dt_val,
                             mach_val,
                             v_val
                         )
