@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import matplotlib.pyplot as plt
-from models/unet_models import snap_conditioned_unet_flow_film_cached as model_lib
+from models.unet_models import snap_condtioned_unet_flow_film_cached as model_lib
 
 
 # ==========================================================================
@@ -293,7 +293,7 @@ def load_cache(files, stats, start_idx, cache_size=32):
         stats["channel_std"]
     )
 
-    time_fracs = normalize_time_points(
+    time_fracs = normalize_time_fraction(
         time_fracs,
         stats["tf_min"],
         stats["tf_max"]
@@ -334,7 +334,7 @@ def load_files(data_dir, max_samples=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, default="khi_data")
-    parser.add_argument("--ckpt-dir", type=str, default="conditioned_unet_checkpoints")
+    parser.add_argument("--ckpt-dir", type=str, default="snap_conditioned_unet_checkpoints")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=150000)
