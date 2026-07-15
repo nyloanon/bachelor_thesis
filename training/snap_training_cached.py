@@ -72,13 +72,13 @@ def cached_batch(key, cache, batch_size):
             cache["states"].shape[1]
         )
 
-        snap, tf, mach = sample_transition(
+        snap, tf, mach = sample_snap(
             cache,
             sim_idx,
             t_idx
         )
 
-        x0 = jax.random.normal(key_noise, target.shape)
+        x0 = jax.random.normal(key_noise, snap.shape)
 
         t_rf = jax.random.uniform(key_rf, ())
 
@@ -97,7 +97,7 @@ def cached_batch(key, cache, batch_size):
     return jax.vmap(single_sample)(keys)
 
 
-def loss_function(model, x_t, current, t_rf, tf, mach, v_target):
+def loss_function(model, x_t, t_rf, tf, mach, v_target):
     v_pred = jax.vmap(model)(x_t, t_rf, tf, mach)
     return jnp.mean((v_pred - v_target) ** 2)
 

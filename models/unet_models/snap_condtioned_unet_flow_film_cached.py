@@ -255,7 +255,7 @@ class UNet(eqx.Module):
         self.out_norm = eqx.nn.GroupNorm(GROUPS, widths[0])
         self.out_conv = eqx.nn.Conv2d(widths[0], OUTPUT_CHANNELS, kernel_size=1, key=next(keys))
 
-    def __call__(self, x_t_rf, t_rf, t_frac, mach):
+    def __call__(self, x, t_rf, t_frac, mach):
         #----------- flow time, physical time and mach conditioning ----------------
         
         t_rf_emb = self.t_rf_mlp(fourier_embedding(t_rf))
