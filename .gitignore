@@ -1,4 +1,6 @@
 /khi_data
+/test_data
+/snap_conditioned_unet_generations
 /data_no_mach
 /figures_no_mach
 /5.5k_data_no_mach

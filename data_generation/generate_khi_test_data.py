@@ -61,7 +61,7 @@ from astronomix import (
 from astronomix.option_classes.simulation_config import SnapshotSettings
 
 # shared slab setup
-from _khi_slab_common import (
+from data_generation._khi_slab_common import (
     BOX_SIZE,
     DENSITY_CONTRAST,
     FIX_STRATEGY,
@@ -90,23 +90,23 @@ def parse_args():
                         help="snapshots stored per trajectory, spanning [0, age * t_KH]")
     parser.add_argument("--mach-min", type=float, default=0.5)
     parser.add_argument("--mach-max", type=float, default=1.8)
-    parser.add_argument("--mach", type=float, default=None,
+    parser.add_argument("--mach", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8],
                         help="fix the Mach number for every sample (overrides the range)")
     parser.add_argument("--num-cells", type=int, default=256)
     parser.add_argument("--age", type=float, default=1.2,
                         help="trajectory length in units of the KH time t_KH")
     parser.add_argument("--seed", type=int, default=0,
                         help="base seed; sample j is determined by (seed, j)")
-    parser.add_argument("--out-dir", type=str, default="data/khi_training")
+    parser.add_argument("--out-dir", type=str, default="khi_data")
     parser.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     return parser.parse_args()
 
 
-def sample_mach(rng, args):
+def sample_mach(rng, args, i):
     """The Mach number for one sample: fixed if requested, else uniform in range."""
 
-    if args.mach is not None:
-        return float(args.mach)
+    if args.mach is not None and i is not None:
+        return float(args.mach[i])
     return float(rng.uniform(args.mach_min, args.mach_max))
 
 
@@ -176,65 +176,72 @@ def main():
         f"{args.start_index + args.num_samples}) into {out_dir} "
         f"(~{approx_mb:.0f} MB each, {args.dtype})"
     )
+    
+    total_time = 0.0
 
-    for offset in range(args.num_samples):
-        index = args.start_index + offset
-        out_path = out_dir / f"sample_{index:06d}.npz"
-        if out_path.exists():
-            print(f"  [{index}] exists, skipping")
-            continue
+    
+    for m in range(len(args.mach)):
+        time_mach = 0.0
+        for offset in range(args.num_samples):
+            index = args.start_index + offset
+            rng = np.random.default_rng([args.seed, index])
+            mach = sample_mach(rng, args, m)
+            out_path = out_dir / f"sample_{mach}_{index:06d}.npz"
+            if out_path.exists():
+                print(f"  [{index}] exists, skipping")
+                continue
 
-        # Sample j is fully determined by (seed, j): draw the Mach number and a
-        # perturbation seed from one per-sample stream.
-        rng = np.random.default_rng([args.seed, index])
-        mach = sample_mach(rng, args)
-        perturbation_seed = int(rng.integers(1 << 31))
-        recipe = sampled_perturbation_params(perturbation_seed)
+            # Sample j is fully determined by (seed, j): draw the Mach number and a
+            # perturbation seed from one per-sample stream.
+            perturbation_seed = int(rng.integers(1 << 31))
+            recipe = sampled_perturbation_params(perturbation_seed)
 
-        kh_time = kelvin_helmholtz_time(mach)
-        t_end = args.age * kh_time
+            kh_time = kelvin_helmholtz_time(mach)
+            t_end = args.age * kh_time
 
-        initial_state = build_sample_initial_state(
-            perturbation_seed, mach, config, registered_variables, helper_data
-        )
+            initial_state = build_sample_initial_state(
+                perturbation_seed, mach, config, registered_variables, helper_data
+            )
 
-        start = timer()
-        snapshot_data = time_integration(
-            initial_state,
-            config,
-            build_params(t_end),
-            registered_variables,
-        )
+            start = timer()
+            snapshot_data = time_integration(
+                initial_state,
+                config,
+                build_params(t_end),
+                registered_variables,
+            )
 
-        # np.asarray forces the device -> host transfer (and thus completion).
-        states = np.asarray(snapshot_data.states)[:, channel_indices, :, :].astype(np_dtype)
-        time_points = np.asarray(snapshot_data.time_points)
+            # np.asarray forces the device -> host transfer (and thus completion).
+            states = np.asarray(snapshot_data.states)[:, channel_indices, :, :].astype(np_dtype)
+            time_points = np.asarray(snapshot_data.time_points)
 
-        np.savez_compressed(
-            out_path,
-            states=states,
-            channel_names=np.asarray(CHANNEL_NAMES),
-            time_points=time_points.astype(np.float64),
-            time_fractions=(time_points / kh_time).astype(np.float64),
-            mach=np.float64(mach),
-            kh_time=np.float64(kh_time),
-            perturbation_modes=np.asarray(recipe["modes"]),
-            perturbation_weights=np.asarray(recipe["weights"]),
-            perturbation_phases=np.asarray(recipe["phases"]),
-            perturbation_amplitude_fraction=np.float64(recipe["amplitude_fraction"]),
-            density_contrast=np.float64(DENSITY_CONTRAST),
-            gamma=np.float64(GAMMA),
-            box_size=np.float64(BOX_SIZE),
-            num_cells=np.int64(args.num_cells),
-            smoothing_length=np.float64(smoothing_length),
-        )
-        print(
-            f"  [{index}] M={mach:.3f} modes={recipe['modes']} "
-            f"-> {out_path.name} ({timer() - start:.1f}s)"
-        )
+            np.savez_compressed(
+                out_path,
+                states=states,
+                channel_names=np.asarray(CHANNEL_NAMES),
+                time_points=time_points.astype(np.float64),
+                time_fractions=(time_points / kh_time).astype(np.float64),
+                mach=np.float64(mach),
+                kh_time=np.float64(kh_time),
+                perturbation_modes=np.asarray(recipe["modes"]),
+                perturbation_weights=np.asarray(recipe["weights"]),
+                perturbation_phases=np.asarray(recipe["phases"]),
+                perturbation_amplitude_fraction=np.float64(recipe["amplitude_fraction"]),
+                density_contrast=np.float64(DENSITY_CONTRAST),
+                gamma=np.float64(GAMMA),
+                box_size=np.float64(BOX_SIZE),
+                num_cells=np.int64(args.num_cells),
+                smoothing_length=np.float64(smoothing_length),
+            )
+            print(
+                f"  [{index}] M={mach:.3f} modes={recipe['modes']} "
+                f"-> {out_path.name} ({timer() - start:.1f}s)"
+            )
 
-    print("Done.")
-
+            time_mach += timer() - start
+        total_time += time_mach
+        print(f"Done with Mach number {mach}. Total generation time for {args.num_samples}:  time_mach = {time_mach}")
+    print(f"Total generation time for Mach numbers {args.mach} and {args.num_samples} per Mach number: total_time = {total_time}")
 
 if __name__ == "__main__":
     main()
