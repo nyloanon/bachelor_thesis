@@ -17,6 +17,7 @@ autocvd(num_gpus=1)
 # ==========================================================================
 
 import argparse
+from timeit import default_timer as timer
 
 import equinox as eqx
 import jax
@@ -24,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 
-from models/unet_models import snap_conditioned_unet_flow_film_cached as model_lib
+from models.unet_models import snap_condtioned_unet_flow_film_cached as model_lib
 
 CHANNELS = ["density", "velocity_x", "velocity_y", "pressure"]
 
@@ -33,14 +34,14 @@ CHANNELS = ["density", "velocity_x", "velocity_y", "pressure"]
 #  Heun (RK2) rectified-flow sampler
 # ==========================================================================
 
-def sample(model, x, steps=100):
+def sample(model, x, t_frac, mach, steps=100):
     dt = 1.0 / steps
     for i in range(steps):
         t = i / steps
-        v1 = model(x, t)
+        v1 = model(x, t, t_frac, mach)
         x_euler = x + dt * v1
         t_next = min(t + dt, 1.0)
-        v2 = model(x_euler, t_next)
+        v2 = model(x_euler, t_next, t_frac, mach)
         x = x + dt * 0.5 * (v1 + v2)
     return x
 
@@ -58,13 +59,13 @@ def batched_sample(model, noises, t_fracs, machs, steps=100):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, default="snap_conditioned_unet_checkpoints/unet_ema_final.eqx")
+    parser.add_argument("--ckpt", type=str, default="snap_conditioned_unet_checkpoints/conditioned_unet_ema_final.eqx")
     parser.add_argument("--ckpt-dir", type=str, default="snap_conditioned_unet_checkpoints")
     parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--mach", type=float, nargs="+", default=[0.6, 1.0, 1.6], help="Mach numbers to condition on (rows)")
-    parser.add_argument("--time fraction", type=float, nargs="+", default=[0.2, 0.6, 1.0], help="physical time fraction t/t_KH to condition on (columns)")
-    parser.add_argument("--channel", type=int, default=0, help=" channel to display in the grid (0=density)")
-    parser.add_argument("--num-samples", type=int, default=8)
+    parser.add_argument("--mach", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8], help="Mach numbers to condition on (rows)")
+    parser.add_argument("--time_fraction", type=float, nargs="+", default=[1.0], help="Physical time fraction t/t_KH to condition on (columns)")
+    parser.add_argument("--channels", type=int, nargs="+", default=[0, 1, 2, 3], help="Channels to display in the grid (0=density, 1=velocity_x, 2=velocity_y, 3=pressure)")
+    parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--out-dir", type=str, default="snap_conditioned_unet_generations")
     parser.add_argument("--seed", type=int, default=999)
@@ -86,80 +87,96 @@ def main():
         return (tf - tf_min) / (tf_max - tf_min + 1e-6)
 
     def norm_mach(m):
-        return (m - mach_mean) / mach_std
+        return (m - mach_mean) / mach_std   
+    
 
     machs = list(args.mach)
     tfracs = list(args.time_fraction)
     n_rows, n_cols = len(machs), len(tfracs)
 
-    # ---- generate ----
+    # ---- timed generation ----
     # one shared noise per column so differences across a row are purely the
     # conditioning (same latent, different Mach) -- makes the effect legible.
 
-    base_noise = jax.random.normal(jax.random.key(args.seed), (n_cols, 4, 256, 256))
+    base_noise = jax.random.normal(jax.random.key(args.seed), (args.num_samples,n_cols, 4, 256, 256))
 
     # build the flattened (mach, t_frac) grid 
-    grid_noise, grid_tf, grid_mach = [], [], []
+    mach_ranges = np.array_split(machs, 3)
+    ranges = ["low", "mid","high"]
 
-    for r, m in enumerate(machs):
+    for i, mach_range in enumerate(mach_ranges):
+        grid_noise, grid_tf, grid_mach = [], [], []
+        n_rows_chunk = len(mach_range)
+        range_ = ranges[i]
 
-        for c, tf in enumerate(tfracs):
+        for s in range(args.num_samples):
+            for m in mach_range:
+                for c, tf in enumerate(tfracs):
+                    grid_noise.append(base_noise[s, c])
+                    grid_tf.append(norm_tf(tf))
+                    grid_mach.append(norm_mach(m))
 
-            grid_noise.append(base_noise[c])
-            grid_tf.append(norm_tf(tf))
-            grid_mach.append(norm_mach(m))
+        grid_noise = jnp.asarray(np.stack(grid_noise))
+        grid_tf = jnp.asarray(np.array(grid_tf, dtype=np.float32))
+        grid_mach = jnp.asarray(np.array(grid_mach, dtype=np.float32))
 
-    grid_noise = jnp.asarray(np.stack(grid_noise))
-    grid_tf = jnp.asarray(np.array(grid_tf, dtype=np.float32))
-    grid_mach = jnp.asarray(np.array(grid_mach, dtype=np.float32))
+        start = timer()
 
-    gen = batched_sample(model, grid_noise, grid_tf, grid_mach, args.steps)  # (R*C,4,H,W)
-    gen = gen * channel_std[None] + channel_mean[None]                       # denormalise
-    gen = gen.reshape(n_rows, n_cols, 4, 256, 256)
+        gen = batched_sample(model, grid_noise, grid_tf, grid_mach, args.steps)  # (R*C,4,H,W)
+        gen = gen * channel_std[None] + channel_mean[None]                       # denormalise
+        gen = gen.reshape(args.num_samples, n_rows_chunk, n_cols, 4, 256, 256)
 
-    np.save(os.path.join(args.out_dir, "grid_generations.npy"), gen)
-    print(f"generated grid {gen.shape} -> {args.out_dir}/grid_generations.npy")
-    ch = args.channel
-    name = CHANNELS[ch]
+        np.save(os.path.join(args.out_dir, f"grid_generations_{range_}.npy"), gen)
+        jax.block_until_ready(gen)
+
+        time_gen = timer() - start
+
+        print(f"generated grid {gen.shape} -> {args.out_dir}/grid_generations_{range_}.npy. Generation time = {time_gen:.1f} s")
+        channels = args.channels
+
+            
+        for ch in channels:
+
+            # shared colour scale across the whole grid for the chosen channel
+            vmin = float(gen[:, :, :, ch].min())
+            vmax = float(gen[:, :, :, ch].max())
+
+            fig, axes = plt.subplots(n_rows_chunk, args.num_samples, figsize=(3.2 * args.num_samples, 3.2 * n_rows_chunk), squeeze=False)
+            name = CHANNELS[ch]
+
+            for r in range(n_rows_chunk):
+
+                for c in range(args.num_samples):
+                    ax = axes[r][c]
+                    im = ax.imshow(gen[c, r, 0, ch].T, origin="lower", cmap="jet", vmin=vmin, vmax=vmax)
+                    ax.set_xticks([]); ax.set_yticks([])
+
+                    if r == 0:
+                        ax.set_title(f"Sample {c+1}")
+
+                    if c == 0:
+                        ax.set_ylabel(f"Mach = {mach_range[r]:.2f}", fontsize=12)
+
+            fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02)
+            fig.suptitle(f"Conditioned KHI generation — {name} (rows: Mach, cols: samples)\n"
+            f"t/t_KH = {tfracs[0]:.2f}"
+            , fontsize=14)
+
+            out = os.path.join(args.out_dir, f"conditioning_grid_{range_}_{name}.png")
+            fig.savefig(out, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            print(f"wrote {out}")
 
 
 
-    # shared colour scale across the whole grid for the chosen channel
-    vmin = float(gen[:, :, ch].min())
-    vmax = float(gen[:, :, ch].max())
+    # # per-(mach,time) mean density, a quick numeric check that conditioning bites
+    # print("\nmean density by (Mach, t/t_KH):")
+    # header = "        " + "".join(f"tf={tf:<6.2f}" for tf in tfracs)
+    # print(header)
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.2 * n_cols, 3.2 * n_rows), squeeze=False)
-
-    for r in range(n_rows):
-
-        for c in range(n_cols):
-            ax = axes[r][c]
-            im = ax.imshow(gen[r, c, ch].T, origin="lower", cmap="jet", vmin=vmin, vmax=vmax)
-            ax.set_xticks([]); ax.set_yticks([])
-
-            if r == 0:
-                ax.set_title(f"t/t_KH = {tfracs[c]:.2f}")
-
-            if c == 0:
-                ax.set_ylabel(f"Mach = {machs[r]:.2f}", fontsize=12)
-
-    fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02)
-    fig.suptitle(f"Conditioned KHI generation — {name} (rows: Mach, cols: time fraction)", fontsize=14)
-
-    out = os.path.join(args.out_dir, f"conditioning_grid_{name}.png")
-    fig.savefig(out, dpi=120, bbox_inches="tight")
-    print(f"wrote {out}")
-
-
-
-    # per-(mach,time) mean density, a quick numeric check that conditioning bites
-    print("\nmean density by (Mach, t/t_KH):")
-    header = "        " + "".join(f"tf={tf:<6.2f}" for tf in tfracs)
-    print(header)
-
-    for r, m in enumerate(machs):
-        row = f"M={m:<5.2f} " + "".join(f"{gen[r, c, 0].mean():<9.3f}" for c in range(n_cols))
-        print(row)
+    # for r, m in enumerate(machs):
+    #     row = f"M={m:<5.2f} " + "".join(f"{gen[r, c, 0].mean():<9.3f}" for c in range(n_cols))
+    #     print(row)
 
 if __name__ == "__main__":
 

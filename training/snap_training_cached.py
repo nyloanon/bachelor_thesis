@@ -20,8 +20,11 @@ autocvd(num_gpus=1)
 #  velocity field from noise (t=0) to data (t=1).
 # ==========================================================================
 
+from timeit import default_timer as timer
+
 import argparse
 import glob
+import pandas as pd
 
 import equinox as eqx
 import jax
@@ -345,6 +348,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cache-size", type=int, default=32)
     parser.add_argument("--steps-per-cache", type=int, default=128)
+    parser.add_argument("--hp_opt", type=int, default=0, help="Turn hyper-parameter optimization on or off: 0=off, 1=on.")
     args = parser.parse_args()
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
@@ -361,98 +365,193 @@ def main():
     stats = {k: jnp.asarray(v) for k, v in stats.items()}
 
     # ---- train / val split ----
-    perm = np.random.RandomState(args.seed).permutation(len(files))
+    split_rng = np.random.RandomState(args.seed)
+    perm = split_rng.permutation(len(files))
     files = [files[i] for i in perm]
 
     n_val = max(1, int(len(files) * args.val_frac))
     val_files, train_files = files[:n_val], files[n_val:]
     val_cache = load_cache(val_files, stats, 0, min(args.cache_size, len(val_files)))
     x_t_val, t_rf_val, t_frac_val, mach_val, v_val = cached_batch(
-        jax.random.key(12345), val_cache, args.val_batch
-    )
+    jax.random.key(12345), val_cache, args.val_batch)
     print("validation batch created.")
 
     # ---- model / optimiser ----
-    key = jax.random.key(args.seed)
-    key, mkey = jax.random.split(key)
-    model = model_lib.create_model(mkey)
-    ema_model = model
-    n_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array)))
-    print(f"model params: {n_params / 1e6:.2f} M")
+    if args.hp_opt == 0:
 
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(args.lr, weight_decay=1e-4),
-    )
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+        key = jax.random.key(args.seed)
+        key, mkey = jax.random.split(key)
+        model = model_lib.create_model(mkey)
+        ema_model = model
+        n_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array)))
+        print(f"model params: {n_params / 1e6:.2f} M")
 
-    # ---- training loop (streaming cache over the file list) ----
-    global_step = 0
-    loss_history, val_history, val_steps = [], [], []
-    key_train = jax.random.key(args.seed + 1)
-    checkpoint_steps = {args.steps // 4, args.steps // 2, 3 * args.steps // 4, args.steps}
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(args.lr, weight_decay=1e-4),
+        )
+        opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    while global_step < args.steps:
-        perm = np.random.permutation(len(train_files))
-        shuffled_files = [train_files[i] for i in perm]
+        # ---- training loop (streaming cache over the file list) ----
+        global_step = 0
+        loss_history, val_history, val_steps = [], [], []
+        key_train = jax.random.key(args.seed + 1)
+        checkpoint_steps = {args.steps // 4, args.steps // 2, 3 * args.steps // 4, args.steps}
+        
+        rng = np.random.RandomState(args.seed)
+        start = timer()
+        
+        while global_step < args.steps:
 
-        cache_start = 0
+            perm = rng.permutation(len(train_files))
+            shuffled_files = [train_files[i] for i in perm]
 
-        while cache_start < len(shuffled_files) and global_step < args.steps:
-            cache = load_cache(shuffled_files, stats, cache_start, args.cache_size)
+            cache_start = 0
 
-            for _ in range(args.steps_per_cache):
-                if global_step >= args.steps:
-                    break
+            while cache_start < len(shuffled_files) and global_step < args.steps:
+                cache = load_cache(shuffled_files, stats, cache_start, args.cache_size)
 
-                key_train, batch_key = jax.random.split(key_train)
-                x_t, t_rf, t_frac, mach, v_target = cached_batch(
-                    batch_key, cache, args.batch_size
-                )
+                for _ in range(args.steps_per_cache):
+                    if global_step >= args.steps:
+                        break
 
-                model, ema_model, opt_state, loss = train_step(
-                    model, ema_model, opt_state,
-                    x_t, t_rf, t_frac, mach, v_target,
-                    optimizer, args.ema_decay,
-                )
-                global_step += 1
-
-                loss_history.append(float(loss))
-
-                if global_step % 1000 == 0:
-                    vm = float(val_loss(ema_model, x_t_val, t_rf_val, t_frac_val, mach_val, v_val))
-                    val_history.append(vm)
-                    val_steps.append(global_step)
-                    print(f"step {global_step:6d} | train {float(loss):.5f} | val(ema) {vm:.5f}",flush=True)
-
-                if global_step in checkpoint_steps:
-                    model_lib.save_model(
-                        model, os.path.join(args.ckpt_dir, f"conditioned_unet_{global_step}.eqx")
-                    )
-                    model_lib.save_model(
-                        ema_model, os.path.join(args.ckpt_dir, f"conditioned_unet_ema_{global_step}.eqx")
+                    key_train, batch_key = jax.random.split(key_train)
+                    x_t, t_rf, t_frac, mach, v_target = cached_batch(
+                        batch_key, cache, args.batch_size
                     )
 
-            cache_start += args.cache_size
+                    model, ema_model, opt_state, loss = train_step(
+                        model, ema_model, opt_state,
+                        x_t, t_rf, t_frac, mach, v_target,
+                        optimizer, args.ema_decay,
+                    )
+                    loss_history.append(loss)
+                    global_step += 1
 
-    model_lib.save_model(model, os.path.join(args.ckpt_dir, "conditioned_unet_final.eqx"))
-    model_lib.save_model(ema_model, os.path.join(args.ckpt_dir, "conditioned_unet_ema_final.eqx"))
-    print("saved final checkpoints")
+                    if global_step % 1000 == 0:
+                        vm = float(val_loss(ema_model, x_t_val, t_rf_val, t_frac_val, mach_val, v_val))
+                        val_history.append(vm)
+                        val_steps.append(global_step)
+                        print(f"step {global_step:6d} | train {float(loss):.5f} | val(ema) {vm:.5f}",flush=True)
 
-    # ---- loss plot ----
-    plt.figure()
-    plt.plot(loss_history, alpha=0.4, label="train (per step)")
-    if len(loss_history) > 100:
-        w = 100
-        smooth = np.convolve(loss_history, np.ones(w) / w, mode="valid")
-        plt.plot(np.arange(w - 1, len(loss_history)), smooth, label="train (smoothed)")
+                    if global_step in checkpoint_steps:
+                        model_lib.save_model(
+                            model, os.path.join(args.ckpt_dir, f"conditioned_unet_{global_step}.eqx")
+                        )
+                        model_lib.save_model(
+                            ema_model, os.path.join(args.ckpt_dir, f"conditioned_unet_ema_{global_step}.eqx")
+                        )
 
-    plt.plot(val_steps, val_history, "o-", label="val (ema)")
-    plt.yscale("log")
-    plt.xlabel("step"); plt.ylabel("MSE loss"); plt.legend()
-    plt.title("(Mach, time)-conditioned rectified-flow training")
-    plt.savefig("loss_history.png", dpi=120)
-    print("wrote loss_history.png")
+                cache_start += args.cache_size
+
+        time_training = timer() - start
+        model_lib.save_model(model, os.path.join(args.ckpt_dir, "conditioned_unet_final.eqx"))
+        model_lib.save_model(ema_model, os.path.join(args.ckpt_dir, "conditioned_unet_ema_final.eqx"))
+        print(f"Saved final checkpoints. Total training time = {time_training} s")
+
+        # ---- loss plot ----
+        loss_history = [float(l) for l in loss_history]
+        plt.figure()
+        plt.plot(loss_history, alpha=0.4, label="train (per step)")
+        if len(loss_history) > 100:
+            w = 100
+            smooth = np.convolve(loss_history, np.ones(w) / w, mode="valid")
+            plt.plot(np.arange(w - 1, len(loss_history)), smooth, label="train (smoothed)")
+
+        plt.plot(val_steps, val_history, "o-", label="val (ema)")
+        plt.yscale("log")
+        plt.xlabel("step"); plt.ylabel("MSE loss"); plt.legend()
+        plt.title("(Mach, time)-conditioned rectified-flow training")
+        plt.savefig("loss_history.png", dpi=120)
+        print("wrote loss_history.png")
+    
+    else:
+        start = timer()
+
+        # set of hyper-parameters
+        lrs = [1e-4, 2e-4, 5e-4, 1e-3]
+        batch_sizes = [2, 4, 8]
+        weight_decays = [1e-5, 1e-4]
+
+        steps = 30000
+        results = []
+        
+
+        for lr in lrs:
+            for bs in batch_sizes:
+                for wds in weight_decays:
+
+                    rng = np.random.RandomState(args.seed)
+
+                    key = jax.random.key(args.seed)
+                    key, mkey = jax.random.split(key)
+                    model = model_lib.create_model(mkey)
+                    ema_model = model
+                    n_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array)))
+                    print(f"model params: {n_params / 1e6:.2f} M")
+
+                    optimizer = optax.chain(
+                    optax.clip_by_global_norm(1.0),
+                    optax.adamw(lr, weight_decay=wds),
+                    )
+                    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+                    
+                    global_step = 0
+                    loss_history, val_history, val_steps = [], [], []
+                    key_train = jax.random.key(args.seed + 1)
+
+                    while global_step < steps:
+                        perm = rng.permutation(len(train_files))
+                        shuffled_files = [train_files[i] for i in perm]
+
+                        cache_start = 0
+
+                        while cache_start < len(shuffled_files) and global_step < steps:
+                            cache = load_cache(shuffled_files, stats, cache_start, args.cache_size)
+
+                            for _ in range(args.steps_per_cache):
+                                if global_step >= steps:
+                                    break
+
+                                key_train, batch_key = jax.random.split(key_train)
+                                x_t, t_rf, t_frac, mach, v_target = cached_batch(
+                                    batch_key, cache, bs
+                                )
+
+                                model, ema_model, opt_state, loss = train_step(
+                                    model, ema_model, opt_state,
+                                    x_t, t_rf, t_frac, mach, v_target,
+                                    optimizer, args.ema_decay,
+                                )
+                                global_step += 1
+
+                                loss_history.append(loss)
+
+                                if global_step % 1000 == 0:
+                                    vm = float(val_loss(ema_model, x_t_val, t_rf_val, t_frac_val, mach_val, v_val))
+                                    val_history.append(vm)
+                                    val_steps.append(global_step)
+                                    print(f"step {global_step:6d} | train {float(loss):.5f} | val(ema) {vm:.5f}",flush=True)
+                            
+                            cache_start += args.cache_size
+                    
+                    results.append({
+                        "lr" : lr,
+                        "batch_size": bs,
+                        "weight_decay": wds,
+                        "mean_val": np.mean(val_history[-5:]),
+                        "median_val": np.median(val_history[-5:]),
+                        "min_val": np.min(val_history)
+                    })
+        time_hp_opt = timer() - start
+
+        df = pd.DataFrame(results)
+        df.to_csv(os.path.join(args.ckpt_dir, "hp_results.csv"), index=False)
+        best_hps = min(results, key=lambda x: x["mean_val"])
+        print(f"Optimal set of hyper-parameters: {best_hps}.\n"
+        f"Hyper-parameter optimization time = {time_hp_opt:.1f} s.\n"
+        f"Saved the results of hyper-parameter optimization to csv-file under {args.ckpt_dir}.")
+
 
 if __name__ == "__main__":
     main()

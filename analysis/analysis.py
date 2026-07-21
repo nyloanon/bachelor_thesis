@@ -14,13 +14,20 @@ autocvd(num_gpus=1)
 #    * kinetic energy spectrum E(k)
 # ==========================================================================
 
+# loading of data
 import argparse
 import glob
-import math
 import os
+from collections import defaultdict
 
+# analysis
+import math
 import jax.numpy as jnp
 import numpy as np
+from scipy.stats import wasserstein_distance
+from scipy.spatial.distance import jensenshannon
+from scipy.special import rel_entr
+
 import matplotlib.pyplot as plt
 
 CHANNELS = ["density", "velocity_x", "velocity_y", "pressure"]
@@ -105,14 +112,79 @@ def density_power_spectrum(rho):
     return k_centers, jnp.stack(Pk_all)
 
 
+def pdf_analysis(gen, real):
+    """
+    Compare generated PDF to real PDF with metrics: wasserstein distance, jensen-shannon divergence and KL divergence
+    """
+
+    _, n_channels, _, _ = gen.shape
+
+    
+    w_distances = np.zeros(n_channels)
+    js_divergence = np.zeros_like(w_distances)
+    kl_divergence = np.zeros_like(w_distances)
+
+    
+    for c in range(n_channels):
+        
+        gen_values = gen[:,c].ravel()
+        real_values = real[:,c].ravel()
+        
+        # wasserstein distances
+        w_distances[c] = wasserstein_distance(
+            real_values,
+            gen_values
+        )   
+
+        # jensen-shannon divergence and KL metric
+        lo = min(real_values.min(), gen_values.min())
+        hi = max(real_values.max(), gen_values.max())
+        bins = np.linspace(lo, hi, 120)
+
+        hist_real, edges = np.histogram(
+            real_values,
+            bins=bins,
+            range=(lo, hi),
+            density=False,
+        )
+
+        hist_gen, _ = np.histogram(
+            gen_values,
+            bins=edges,
+            density=False,
+        )
+
+        # Convert counts to probabilities
+        eps = 1e-12
+        P = hist_real.astype(float) + eps
+        Q = hist_gen.astype(float) + eps
+
+        P /= P.sum()
+        Q /= Q.sum()
+
+        js_divergence[c] = jensenshannon(
+            P,
+            Q    
+        )
+
+        kl_divergence[c] = np.sum(rel_entr(P, Q))
+
+    return w_distances, js_divergence, kl_divergence
+
+    
+
 # ==========================================================================
 #  Plots
 # ==========================================================================
 
-def plot_value_distributions(gen, real, out_path):
-    """Histogram PDFs per channel: generated vs real."""
+def plot_value_distributions(gen, real, mach, tf, out_path):
+    """Histogram PDFs per channel: generated vs real and metrics print in legend."""
+    # compute statistical metrics
+    w_distances, js_divergence, kl_divergence = pdf_analysis(gen, real)
+    
     fig, axes = plt.subplots(1, 4, figsize=(20, 4))
     for c, name in enumerate(CHANNELS):
+
         ax = axes[c]
         g = np.asarray(gen[:, c]).ravel()
         r = np.asarray(real[:, c]).ravel()
@@ -121,10 +193,29 @@ def plot_value_distributions(gen, real, out_path):
         bins = np.linspace(lo, hi, 120)
         ax.hist(r, bins=bins, density=True, histtype="step", label="real", color="k")
         ax.hist(g, bins=bins, density=True, histtype="step", label="generated", color="r")
-        ax.set_title(name)
+
+        metrics = (
+        f"W = {w_distances[c]:.3e}\n"
+        f"JS = {js_divergence[c]:.3e}\n"
+        f"KL = {kl_divergence[c]:.3e}"
+        )
+
+        ax.text(
+            0.98,
+            0.98,
+            metrics,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="gray"),
+        )
+
+        ax.set_title(f"{name} for Mach {mach} and time fraction {tf}")
         ax.set_xlabel("value")
         ax.set_yscale("log")
-        ax.legend()
+        ax.legend(["Real", "Generated"])
+
     axes[0].set_ylabel("PDF")
     fig.suptitle("Value distributions: generated vs real")
     fig.tight_layout()
@@ -133,7 +224,7 @@ def plot_value_distributions(gen, real, out_path):
     print(f"wrote {out_path}")
 
 
-def plot_spectra(gen, real, out_path):
+def plot_spectra(gen, real, mach, tf, out_path):
     """Mean density power spectrum and kinetic energy spectrum."""
     kd, Pk_gen = density_power_spectrum(gen[:, 0])
     _, Pk_real = density_power_spectrum(real[:, 0])
@@ -152,13 +243,13 @@ def plot_spectra(gen, real, out_path):
 
     _band(ax1, kd, Pk_real, "k", "real")
     _band(ax1, kd, Pk_gen, "r", "generated")
-    ax1.set_title("Density power spectrum P(k)")
+    ax1.set_title(f"Density power spectrum P(k) for Mach {mach} and time fraction {tf}")
     ax1.set_xlabel("k"); ax1.set_ylabel("P(k)"); ax1.legend()
     ax1.set_xlim(1, None)
 
     _band(ax2, ke_k, ke_real, "k", "real")
     _band(ax2, ke_k, ke_gen, "r", "generated")
-    ax2.set_title("Kinetic energy spectrum E(k)")
+    ax2.set_title(f"Kinetic energy spectrum E(k) for Mach {mach} and time fraction {tf}")
     ax2.set_xlabel("k"); ax2.set_ylabel("E(k)"); ax2.legend()
     ax2.set_xlim(1, None)
 
@@ -174,21 +265,96 @@ def plot_spectra(gen, real, out_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gen", type=str, default="unet_generations/generations.npy")
-    parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--out-dir", type=str, default="unet_generations")
+    parser.add_argument("--gen", type=str, default="snap_conditioned_unet_generations/grid_generations.npy")
+    parser.add_argument("--data-dir", type=str, default="khi_test_data")
+    parser.add_argument("--out-dir", type=str, default="snap_conditioned_unet_analysis")
+    parser.add_argument("--target_machs", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.8, 0.9, 1.0], help="Mach number snapshots to compare to generations")
+    parser.add_argument("--target_tfs", type=float, nargs="+", default=[1.0], help="Time fraction snapshots to compare to generations")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
+    real_files = sorted(glob.glob(os.path.join(args.data_dir, "sample_*_*.npz"))) # dictionary: need to extract keys "states", "time_fractions" and "mach"
+    gen = np.load(args.gen).astype(np.float32)  # (n_gen, n_mach, n_tf, 4, 256, 256)
+    
+    target_machs = args.target_machs
+    target_tfs = args.target_tfs
 
-    gen = np.load(args.gen).astype(np.float32)  # (N, 4, 256, 256)
-    real_files = sorted(glob.glob(os.path.join(args.data_dir, "final_state_*.npy")))
-    n = min(len(gen), len(real_files))
-    real = np.stack([np.load(f) for f in real_files[:max(n, 64)]]).astype(np.float32)
-    print(f"generated: {gen.shape}, real: {real.shape}")
+    # create real data nestesd dictionary, 1st key: mach number, 2nd key: time fraction. So one gets a dictionary where different mach numbers are assigned a dictionary where the target tfs are the keys and the associated states the data 
+    real_data = defaultdict(lambda: defaultdict(list))
+    print("loading real files according to target mach numbers and target time fractions")
+    
+    i = 0
+    for files in real_files:
 
-    plot_value_distributions(gen, real, os.path.join(args.out_dir, "value_distributions.png"))
-    plot_spectra(gen, real, os.path.join(args.out_dir, "spectra.png"))
+        if i % 20 == 0:
+            print(f"file {i} has been read, {files}")
+        i += 1
+
+        with np.load(files) as data:
+
+            mach = data["mach"]
+            if mach not in target_machs:
+                continue
+
+            mach_idx = np.argmin(np.abs(np.array(target_machs) - mach))
+            mach = target_machs[mach_idx]
+            states = data["states"]
+            tfs = data["time_fractions"]
+
+            for target_tf in target_tfs:
+
+                idx = np.argmin(np.abs(tfs - target_tf))
+
+                real_data[mach][target_tf].append(states[idx])
+        
+
+    # now convert each list into a np array, and get shape (n_data, 4, 256, 256), which can then be fed to the analysis functions
+    print("converting entries of real_data nested dictionary into numpy arrays and stacking them for each pair of target mach number and target tf --> (n_data, 4, 256, 256)")
+    for mach in target_machs:
+        for tf in target_tfs:
+            if len(real_data[mach][tf]) == 0:
+                print(f"No samples found for Mach={mach}, tf={tf}")
+                continue
+            real_data[mach][tf] = np.stack(real_data[mach][tf], axis=0)
+
+    # check how many snapshots have been binned per bin and create plots
+    for mach_idx, mach in enumerate(target_machs):
+        for tf_idx, tf in enumerate(target_tfs):
+
+            if isinstance(real_data[mach][tf], list):
+                continue
+
+            print(
+                f"Mach={mach:.2f}, tf={tf:.2f}: "
+                f"{real_data[mach][tf].shape[0]} samples"
+            )
+
+            gen_subset = gen[:, mach_idx, tf_idx]
+            real_subset = real_data[mach][tf]
+            print(gen_subset[:,0].mean(), gen_subset[:,0].std(), gen_subset.shape)
+            print(real_subset[:,0].mean(), real_subset[:,0].std(), real_subset.shape)
+            
+            plot_value_distributions(
+                gen_subset,
+                real_subset,
+                mach,
+                tf,
+                os.path.join(
+                    args.out_dir,
+                    f"value_distributions_{mach}_{tf}.png"
+                )
+            )
+
+            plot_spectra(
+                gen_subset,
+                real_subset,
+                mach,
+                tf,
+                os.path.join(
+                    args.out_dir,
+                    f"spectra_{mach}_{tf}.png"
+                )
+            )
 
 
 if __name__ == "__main__":
