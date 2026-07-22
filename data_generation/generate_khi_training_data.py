@@ -61,7 +61,7 @@ from astronomix import (
 from astronomix.option_classes.simulation_config import SnapshotSettings
 
 # shared slab setup
-from _khi_slab_common import (
+from data_generation._khi_slab_common import (
     BOX_SIZE,
     DENSITY_CONTRAST,
     FIX_STRATEGY,

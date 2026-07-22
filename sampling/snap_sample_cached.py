@@ -101,8 +101,8 @@ def main():
     base_noise = jax.random.normal(jax.random.key(args.seed), (args.num_samples,n_cols, 4, 256, 256))
 
     # build the flattened (mach, t_frac) grid 
-    mach_ranges = np.array_split(machs, 3)
-    ranges = ["low", "mid","high"]
+    mach_ranges = np.array_split(machs, 4)
+    ranges = ["1", "2", "3", "4"]
 
     for i, mach_range in enumerate(mach_ranges):
         grid_noise, grid_tf, grid_mach = [], [], []
@@ -125,13 +125,19 @@ def main():
         gen = batched_sample(model, grid_noise, grid_tf, grid_mach, args.steps)  # (R*C,4,H,W)
         gen = gen * channel_std[None] + channel_mean[None]                       # denormalise
         gen = gen.reshape(args.num_samples, n_rows_chunk, n_cols, 4, 256, 256)
-
-        np.save(os.path.join(args.out_dir, f"grid_generations_{range_}.npy"), gen)
         jax.block_until_ready(gen)
+        gen = np.asarray(gen)
+        
+        np.savez(
+                os.path.join(args.out_dir, f"grid_generations_{range_}.npz"),
+                states=gen,
+                mach_values=np.asarray(mach_range),
+                time_fraction_values=np.asarray(tfracs)
+            )
 
         time_gen = timer() - start
 
-        print(f"generated grid {gen.shape} -> {args.out_dir}/grid_generations_{range_}.npy. Generation time = {time_gen:.1f} s")
+        print(f"grid generations {gen.shape} -> {args.out_dir}/grid_generations_{range_}.npz. Generation time = {time_gen:.1f} s")
         channels = args.channels
 
             
@@ -167,16 +173,6 @@ def main():
             plt.close(fig)
             print(f"wrote {out}")
 
-
-
-    # # per-(mach,time) mean density, a quick numeric check that conditioning bites
-    # print("\nmean density by (Mach, t/t_KH):")
-    # header = "        " + "".join(f"tf={tf:<6.2f}" for tf in tfracs)
-    # print(header)
-
-    # for r, m in enumerate(machs):
-    #     row = f"M={m:<5.2f} " + "".join(f"{gen[r, c, 0].mean():<9.3f}" for c in range(n_cols))
-    #     print(row)
 
 if __name__ == "__main__":
 

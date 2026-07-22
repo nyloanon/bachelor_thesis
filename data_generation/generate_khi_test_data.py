@@ -97,7 +97,7 @@ def parse_args():
                         help="trajectory length in units of the KH time t_KH")
     parser.add_argument("--seed", type=int, default=0,
                         help="base seed; sample j is determined by (seed, j)")
-    parser.add_argument("--out-dir", type=str, default="khi_data")
+    parser.add_argument("--out-dir", type=str, default="khi_test_data")
     parser.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     return parser.parse_args()
 

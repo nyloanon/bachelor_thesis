@@ -336,7 +336,7 @@ def load_files(data_dir, max_samples=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=str, default="khi_data")
+    parser.add_argument("--data-dir", type=str, default="khi_training_data")
     parser.add_argument("--ckpt-dir", type=str, default="snap_conditioned_unet_checkpoints")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -376,9 +376,9 @@ def main():
     jax.random.key(12345), val_cache, args.val_batch)
     print("validation batch created.")
 
-    # ---- model / optimiser ----
+    # ---- no hp_opt ----
     if args.hp_opt == 0:
-
+        # ------ model / optimizer ---------
         key = jax.random.key(args.seed)
         key, mkey = jax.random.split(key)
         model = model_lib.create_model(mkey)
@@ -465,7 +465,8 @@ def main():
         plt.savefig("loss_history.png", dpi=120)
         print("wrote loss_history.png")
     
-    else:
+    # ---- hp_opt -------
+    elif args.hp_opt == 1:
         start = timer()
 
         # set of hyper-parameters
@@ -543,6 +544,7 @@ def main():
                         "median_val": np.median(val_history[-5:]),
                         "min_val": np.min(val_history)
                     })
+
         time_hp_opt = timer() - start
 
         df = pd.DataFrame(results)
@@ -552,6 +554,8 @@ def main():
         f"Hyper-parameter optimization time = {time_hp_opt:.1f} s.\n"
         f"Saved the results of hyper-parameter optimization to csv-file under {args.ckpt_dir}.")
 
+    else:
+        print("Wrong hp_opt argument given, choose hp_opt = 0 for no hyper-parameter optimization and hp_opt = 1 for hyper-parameter optimization!")
 
 if __name__ == "__main__":
     main()
